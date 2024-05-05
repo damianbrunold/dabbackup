@@ -1,0 +1,4 @@
+/backup-config.json
+/backup-config-*.json
+!/backup-config-template.json
+/backup-full.log

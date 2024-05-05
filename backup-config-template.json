@@ -1,0 +1,15 @@
+{
+    "source": {
+        "directories": [
+            "..."
+        ],
+        "excludes": [
+            "..."
+        ]
+    },
+    "destination": {
+        "directory_full": "...",
+        "directory_partial": "..."
+    },
+    "full_state_file": "..."
+}

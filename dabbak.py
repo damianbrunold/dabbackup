@@ -255,7 +255,7 @@ def make_backup(config):
     partial_log.close()
 
 
-def restore(config, destdir, timestamp):
+def restore(config, destdir, timestamp, source_path):
     print("restore")
     if os.path.exists(destdir):
         print(f"ERR: {destdir} exists, abort")
@@ -270,6 +270,8 @@ def restore(config, destdir, timestamp):
         os.path.join(partial_dir, history[0], "__state.json")
     )
     for fullpath in full_state:
+        if not fullpath.startswith(source_path):
+            continue
         prefix = find_source_prefix(config, fullpath)
         if not prefix:
             print(f"ERR: {fullpath} could not be matched to source dirs")
@@ -336,7 +338,7 @@ def refresh_state(config):
 
 def help():
     print("dabbak backup")
-    print("dabbak restore <dest-dir> [<yyyy-mm-dd>]")
+    print("dabbak restore <dest-dir> [<yyyy-mm-dd> [<source-path>]]")
     print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>]")
     print("dabbak refresh-state")
 
@@ -353,11 +355,14 @@ if __name__ == "__main__":
         make_backup(config)
     elif cmd == "restore":
         dest_dir = args[1]
+        source_path = ""
         if len(args) > 2:
             timestamp = args[2]
+            if len(args) > 3:
+                source_path = args[3]
         else:
             timestamp = datetime.date.today().strftime("%Y-%m-%d")
-        restore(config, dest_dir, timestamp)
+        restore(config, dest_dir, timestamp, source_path)
     elif cmd == "package":
         dest_dir = args[1]
         max_size = args[2].lower()

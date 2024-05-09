@@ -27,7 +27,7 @@ def read_config():
 
 
 def read_full_state(config):
-    read_full_state_file(config["full_state_file"])
+    return read_full_state_file(config["full_state_file"])
 
 
 def read_full_state_file(filepath):
@@ -40,21 +40,6 @@ def read_full_state_file(filepath):
 
 def write_full_state(config, state):
     filepath = config["full_state_file"]
-    with open(filepath, "w", encoding="utf8") as outfile:
-        json.dump(state, outfile, indent=2, ensure_ascii=False)
-
-
-def read_partial_state(partial_dir):
-    filepath = os.path.join(partial_dir, "__state.json")
-    if os.path.exists(filepath):
-        with open(filepath, encoding="utf8") as infile:
-            return json.load(infile)
-    else:
-        return {}
-
-
-def write_partial_state(partial_dir, state):
-    filepath = os.path.join(partial_dir, "__state.json")
     with open(filepath, "w", encoding="utf8") as outfile:
         json.dump(state, outfile, indent=2, ensure_ascii=False)
 
@@ -140,47 +125,76 @@ def make_backup(config):
 
     plog("read state")
     state = read_full_state(config)
-    partial_state = read_partial_state(dest_partial)
 
     if not os.path.exists(dest_partial):
         plog(f"create {dest_partial}", "partial")
         os.mkdir(dest_partial)
 
     new_state = {}
-    new_partial_state = {}
-    for sourcedir in source_dirs:
-        plog(f"processing {sourcedir}")
-        sourcedir = os.path.normpath(sourcedir)
-        prefix = os.path.dirname(sourcedir)
-        prefixlen = len(prefix) + 1
-        for filepath in walk(sourcedir, source_excludes):
-            try:
-                fstat = os.stat(filepath)
-            except Exception as e:
-                plog(f"ERR: file {filepath} not found (fstat)")
-                plog(str(e))
-                continue
-            if filepath in state:
-                # existing file
-                orig_size, orig_mtime = state[filepath]
-                if (
-                    fstat.st_size != orig_size
-                    or int(fstat.st_mtime) != int(orig_mtime)
-                ):
-                    # changed
-                    plog(f"** {filepath}")
+    try:
+        for sourcedir in source_dirs:
+            plog(f"processing {sourcedir}")
+            sourcedir = os.path.normpath(sourcedir)
+            prefix = os.path.dirname(sourcedir)
+            prefixlen = len(prefix) + 1
+            for filepath in walk(sourcedir, source_excludes):
+                try:
+                    fstat = os.stat(filepath)
+                except Exception as e:
+                    plog(f"ERR: file {filepath} not found (fstat)")
+                    plog(str(e))
+                    continue
+                if filepath in state:
+                    # existing file
+                    orig_size, orig_mtime = state[filepath]
+                    if (
+                        fstat.st_size != orig_size
+                        or int(fstat.st_mtime) != int(orig_mtime)
+                    ):
+                        # changed
+                        plog(f"** {filepath}")
 
-                    # update in partial
+                        # update in partial
+                        destpath = os.path.normpath(
+                            os.path.join(dest_partial, filepath[prefixlen:])
+                        )
+                        try:
+                            os.makedirs(os.path.dirname(destpath), exist_ok=True)
+                            if os.path.exists(destpath):
+                                os.remove(destpath)
+                            shutil.copy2(filepath, destpath)
+                        except Exception as e:
+                            plog(
+                                f"ERR: failed to copy {filepath} => {destpath}",
+                                "partial",
+                            )
+                            plog(str(e), "partial")
+
+                        # update in full
+                        destpath = os.path.normpath(
+                            os.path.join(dest_full, filepath[prefixlen:])
+                        )
+                        try:
+                            if os.path.exists(destpath):
+                                os.remove(destpath)
+                            shutil.copy2(filepath, destpath)
+                        except Exception as e:
+                            plog(
+                                f"ERR: failed to copy {filepath} => {destpath}",
+                                "full",
+                            )
+                            plog(str(e), "full")
+                else:
+                    # new file
+                    plog(f"++ {filepath}")
+                    
+                    # include in partial
                     destpath = os.path.normpath(
                         os.path.join(dest_partial, filepath[prefixlen:])
                     )
+                    os.makedirs(os.path.dirname(destpath), exist_ok=True)
                     try:
-                        os.makedirs(os.path.dirname(destpath), exist_ok=True)
                         shutil.copy2(filepath, destpath)
-                        new_partial_state[filepath] = [
-                            fstat.st_size,
-                            int(fstat.st_mtime),
-                        ]
                     except Exception as e:
                         plog(
                             f"ERR: failed to copy {filepath} => {destpath}",
@@ -188,12 +202,11 @@ def make_backup(config):
                         )
                         plog(str(e), "partial")
 
-                    # update in full
+                    # include in full
                     destpath = os.path.normpath(
                         os.path.join(dest_full, filepath[prefixlen:])
                     )
-                    if os.path.exists(destpath):
-                        os.remove(destpath)
+                    os.makedirs(os.path.dirname(destpath), exist_ok=True)
                     try:
                         shutil.copy2(filepath, destpath)
                     except Exception as e:
@@ -202,87 +215,34 @@ def make_backup(config):
                             "full",
                         )
                         plog(str(e), "full")
-                elif filepath in partial_state:
-                    # was in previous partial state
-                    plog(f"** {filepath}")
-
-                    # include in partial if necessary
-                    destpath = os.path.normpath(
-                        os.path.join(dest_partial, filepath[prefixlen:])
-                    )
-                    if not os.path.exists(destpath):
-                        os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                        try:
-                            shutil.copy2(filepath, destpath)
-                        except Exception as e:
-                            plog(
-                                "ERR: failed to copy "
-                                f"{filepath} => {destpath}",
-                                "partial",
-                            )
-                            plog(str(e), "partial")
-                    new_partial_state[filepath] = [
-                        orig_size,
-                        int(orig_mtime),
-                    ]
-            else:
-                # new file
-                plog(f"++ {filepath}")
-                
-                # include in partial
-                destpath = os.path.normpath(
-                    os.path.join(dest_partial, filepath[prefixlen:])
-                )
-                os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                try:
-                    shutil.copy2(filepath, destpath)
-                except Exception as e:
-                    plog(
-                        f"ERR: failed to copy {filepath} => {destpath}",
-                        "partial",
-                    )
-                    plog(str(e), "partial")
-                new_partial_state[filepath] = [
+                new_state[filepath] = [
                     fstat.st_size,
                     int(fstat.st_mtime),
                 ]
-
-                # include in full
+        for filepath in state:
+            if filepath not in new_state:
+                # file does not exist anymore
+                # remove from full
+                plog(f"-- {filepath}", "full")
                 destpath = os.path.normpath(
                     os.path.join(dest_full, filepath[prefixlen:])
                 )
-                os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                try:
-                    shutil.copy2(filepath, destpath)
-                except Exception as e:
-                    plog(
-                        f"ERR: failed to copy {filepath} => {destpath}",
-                        "full",
-                    )
-                    plog(str(e), "full")
-            new_state[filepath] = [
-                fstat.st_size,
-                int(fstat.st_mtime),
-            ]
-    for filepath in state:
-        if filepath not in new_state:
-            # file does not exist anymore
-            # remove from full
-            plog(f"-- {filepath}", "full")
-            destpath = os.path.normpath(
-                os.path.join(dest_full, filepath[prefixlen:])
-            )
-            remove_file(destpath, dest_full)
-            # remove from partial
-            destpath = os.path.normpath(
-                os.path.join(dest_partial, filepath[prefixlen:])
-            )
-            if os.path.exists(destpath):
-                plog(f"-- {filepath}", "partial")
-                remove_file(destpath, dest_partial)
+                remove_file(destpath, dest_full)
+                # remove from partial
+                destpath = os.path.normpath(
+                    os.path.join(dest_partial, filepath[prefixlen:])
+                )
+                if os.path.exists(destpath):
+                    plog(f"-- {filepath}", "partial")
+                    remove_file(destpath, dest_partial)
+    except Exception as e:
+        print("interrupted by exception")
+        print(str(e))
+        import logging
+        logging.exception("xxx")
+        
     plog("write state")
     write_full_state(config, new_state)
-    write_partial_state(dest_partial, new_partial_state)
 
     # copy full state to partial folder (required for restore)
     plog("copying full state to partial folder")
@@ -307,7 +267,7 @@ def restore(config, destdir, timestamp):
         if h <= timestamp
     ]
     full_state = read_full_state_file(
-        os.path.join(partial_dir, history[0], "__state_full.json")
+        os.path.join(partial_dir, history[0], "__state.json")
     )
     for fullpath in full_state:
         prefix = find_source_prefix(config, fullpath)
@@ -343,12 +303,18 @@ def refresh_state(config):
     dest_full = os.path.normpath(
         config["destination"]["directory_full"]
     )
+    dest_partial_base = os.path.normpath(
+        config["destination"]["directory_partial"]
+    )
+    timestamp = datetime.date.today().strftime("%Y-%m-%d")
+    dest_partial = os.path.join(dest_partial_base, timestamp)
 
     new_state = {}
     for sourcedir in source_dirs:
         sourcedir = os.path.normpath(sourcedir)
         prefix = os.path.dirname(sourcedir)
         prefixlen = len(prefix) + 1
+
         destdir = os.path.join(dest_full, sourcedir[prefixlen:])
         prefixlen2 = len(destdir) + 1
         for filepath in walk(destdir, []):
@@ -359,6 +325,12 @@ def refresh_state(config):
                 int(fstat.st_mtime),
             ]
     write_full_state(config, new_state)
+    # copy full state to partial folder (required for restore)
+    plog("copying full state to partial folder")
+    full_state_src = config["full_state_file"]
+    full_state_dest = os.path.join(dest_partial, "__state.json")
+    shutil.copy2(full_state_src, full_state_dest)
+
     print("done")
 
 
@@ -366,7 +338,7 @@ def help():
     print("dabbak backup")
     print("dabbak restore <dest-dir> [<yyyy-mm-dd>]")
     print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>]")
-    print("dabbak refresh-state")
+    print("dabbak refresh-state [--only-full | --only-partial]")
 
 
 if __name__ == "__main__":
@@ -403,7 +375,7 @@ if __name__ == "__main__":
             max_size = int(max_size)
         package_data(config, dest_dir, max_size, timestamp)
     elif cmd == "refresh-state":
-        refresh_state(config)
+       refresh_state(config)
     else:
         help()
         exit(1)

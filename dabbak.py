@@ -94,12 +94,12 @@ def make_backup(config):
 
     full_log = open(
         get_full_log(),
-        "w+",
+        "a+",
         encoding="utf8",
     )
     partial_log = open(
         get_partial_log(dest_partial_base, today),
-        "w+",
+        "a+",
         encoding="utf8",
     )
 
@@ -247,7 +247,7 @@ def make_backup(config):
     # copy full state to partial folder (required for restore)
     plog("copying full state to partial folder")
     full_state_src = config["full_state_file"]
-    full_state_dest = os.path.join(dest_partial, "__state_full.json")
+    full_state_dest = os.path.join(dest_partial, "__state.json")
     shutil.copy2(full_state_src, full_state_dest)
     plog("done")
 
@@ -338,7 +338,7 @@ def help():
     print("dabbak backup")
     print("dabbak restore <dest-dir> [<yyyy-mm-dd>]")
     print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>]")
-    print("dabbak refresh-state [--only-full | --only-partial]")
+    print("dabbak refresh-state")
 
 
 if __name__ == "__main__":

@@ -325,12 +325,13 @@ def restore(config, destdir, timestamp):
                 break
         else:
             print(f"ERR: {relpath} not found in backup")
+    print("done")
 
 
 def package_data(config, max_size, timestamp):
     print("package-data")
     # TODO
-    pass
+    print("done")
 
 
 def refresh_state(config):

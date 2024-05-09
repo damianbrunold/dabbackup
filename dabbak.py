@@ -262,7 +262,7 @@ def restore(config, destdir, timestamp, source_path):
         exit(1)
     partial_dir = config["destination"]["directory_partial"]
     history = [
-        h 
+        h
         for h in sorted(os.listdir(partial_dir), reverse=True)
         if h <= timestamp
     ]
@@ -290,9 +290,46 @@ def restore(config, destdir, timestamp, source_path):
     print("done")
 
 
-def package_data(config, max_size, timestamp):
+def package_data(config, destdir, max_size, timestamp):
     print("package-data")
-    # TODO
+    if os.path.exists(destdir):
+        print(f"ERR: {destdir} exists, abort")
+        exit(1)
+    index = 1
+    size = 0
+    destbase = os.path.join(destdir, f"backup-{timestamp}-part-{index}")
+    partial_dir = config["destination"]["directory_partial"]
+    history = [
+        h
+        for h in sorted(os.listdir(partial_dir), reverse=True)
+        if h <= timestamp
+    ]
+    full_state = read_full_state_file(
+        os.path.join(partial_dir, history[0], "__state.json")
+    )
+    for fullpath in full_state:
+        prefix = find_source_prefix(config, fullpath)
+        if not prefix:
+            print(f"ERR: {fullpath} could not be matched to source dirs")
+            continue
+        relpath = fullpath[len(prefix)+1:]
+        for dirname in history:
+            pathname = os.path.join(partial_dir, dirname, relpath)
+            if os.path.exists(pathname):
+                fstat = os.stat(pathname)
+                filesize = fstat.st_size
+                if size > 0 and size + filesize > max_size:
+                    index += 1
+                    destbase = os.path.join(destdir, f"backup-{timestamp}-part-{index}")
+                    size = 0
+                size += filesize
+                destpath = os.path.join(destbase, relpath)
+                os.makedirs(os.path.dirname(destpath), exist_ok=True)
+                shutil.copy2(pathname, destpath)
+                print(destpath)
+                break
+        else:
+            print(f"ERR: {relpath} not found in backup")
     print("done")
 
 

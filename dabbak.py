@@ -6,7 +6,10 @@ import sys
 
 
 def base_dir():
-    return os.path.normpath(os.path.abspath(os.path.dirname(sys.argv[0])))
+    path = os.path.normpath(os.path.abspath(os.path.dirname(sys.argv[0])))
+    if os.path.basename(path) == "dabbak":
+        path = os.path.dirname(path)
+    return path
 
 
 def get_full_log():
@@ -24,7 +27,10 @@ def read_config():
 
 
 def read_full_state(config):
-    filepath = config["full_state_file"]
+    read_full_state_file(config["full_state_file"])
+
+
+def read_full_state_file(filepath):
     if os.path.exists(filepath):
         with open(filepath, encoding="utf8") as infile:
             return json.load(infile)
@@ -71,8 +77,15 @@ def walk(directory, excludes):
             continue
         if os.path.isdir(fullpath):
             yield from walk(fullpath, excludes)
-        else:
+        elif os.path.isfile(fullpath):
             yield fullpath
+
+
+def find_source_prefix(config, fullpath):
+    for source_dir in config["source"]["directories"]:
+        source_dir = os.path.normpath(source_dir)
+        if fullpath.startswith(source_dir):
+            return os.path.dirname(source_dir)
 
 
 def make_backup(config):
@@ -141,7 +154,12 @@ def make_backup(config):
         prefix = os.path.dirname(sourcedir)
         prefixlen = len(prefix) + 1
         for filepath in walk(sourcedir, source_excludes):
-            fstat = os.stat(filepath)
+            try:
+                fstat = os.stat(filepath)
+            except Exception as e:
+                plog(f"ERR: file {filepath} not found (fstat)")
+                plog(str(e))
+                continue
             if filepath in state:
                 # existing file
                 orig_size, orig_mtime = state[filepath]
@@ -277,5 +295,113 @@ def make_backup(config):
     partial_log.close()
 
 
+def restore(config, destdir, timestamp):
+    print("restore")
+    if os.path.exists(destdir):
+        print(f"ERR: {destdir} exists, abort")
+        exit(1)
+    partial_dir = config["destination"]["directory_partial"]
+    history = [
+        h 
+        for h in sorted(os.listdir(partial_dir), reverse=True)
+        if h <= timestamp
+    ]
+    full_state = read_full_state_file(
+        os.path.join(partial_dir, history[0], "__state_full.json")
+    )
+    for fullpath in full_state:
+        prefix = find_source_prefix(config, fullpath)
+        if not prefix:
+            print(f"ERR: {fullpath} could not be matched to source dirs")
+            continue
+        relpath = fullpath[len(prefix)+1:]
+        for dirname in history:
+            pathname = os.path.join(partial_dir, dirname, relpath)
+            if os.path.exists(pathname):
+                destpath = os.path.join(destdir, relpath)
+                os.makedirs(os.path.dirname(destpath), exist_ok=True)
+                shutil.copy2(pathname, destpath)
+                print(destpath)
+                break
+        else:
+            print(f"ERR: {relpath} not found in backup")
+
+
+def package_data(config, max_size, timestamp):
+    print("package-data")
+    # TODO
+    pass
+
+
+def refresh_state(config):
+    print("refresh-state")
+    source_dirs = [
+        os.path.normpath(path)
+        for path in config["source"]["directories"]
+    ]
+    dest_full = os.path.normpath(
+        config["destination"]["directory_full"]
+    )
+
+    new_state = {}
+    for sourcedir in source_dirs:
+        sourcedir = os.path.normpath(sourcedir)
+        prefix = os.path.dirname(sourcedir)
+        prefixlen = len(prefix) + 1
+        destdir = os.path.join(dest_full, sourcedir[prefixlen:])
+        prefixlen2 = len(destdir) + 1
+        for filepath in walk(destdir, []):
+            fstat = os.stat(filepath)
+            srcpath = os.path.join(sourcedir, filepath[prefixlen2:])
+            new_state[srcpath] = [
+                fstat.st_size,
+                int(fstat.st_mtime),
+            ]
+    write_full_state(config, new_state)
+
+
+def help():
+    print("dabbak backup")
+    print("dabbak restore <dest-dir> [<yyyy-mm-dd>]")
+    print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>]")
+    print("dabbak refresh-state")
+
+
 if __name__ == "__main__":
-    make_backup(read_config())
+    args = sys.argv[1:]
+    if len(args) == 0:
+        print(base_dir())
+        help()
+        exit(1)
+    config = read_config()
+    cmd = args[0]
+    if cmd == "backup":
+        make_backup(config)
+    elif cmd == "restore":
+        dest_dir = args[1]
+        if len(args) > 2:
+            timestamp = args[2]
+        else:
+            timestamp = datetime.date.today().strftime("%Y-%m-%d")
+        restore(config, dest_dir, timestamp)
+    elif cmd == "package":
+        dest_dir = args[1]
+        max_size = args[2].lower()
+        if len(args) > 3:
+            timestamp = args[3]
+        else:
+            timestamp = datetime.date.today().strftime("%Y-%m-%d")
+        if max_size.endswith("g"):
+            max_size = int(max_size[:-1]) * 1024*1024*1024
+        elif max_size.endswith("m"):
+            max_size = int(max_size[:-1]) * 1024*1024
+        elif max_size.endswith("k"):
+            max_size = int(max_size[:-1]) * 1024
+        else:
+            max_size = int(max_size)
+        package_data(config, dest_dir, max_size, timestamp)
+    elif cmd == "refresh-state":
+        refresh_state(config)
+    else:
+        help()
+        exit(1)

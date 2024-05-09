@@ -358,6 +358,7 @@ def refresh_state(config):
                 int(fstat.st_mtime),
             ]
     write_full_state(config, new_state)
+    print("done")
 
 
 def help():

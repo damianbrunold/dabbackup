@@ -131,6 +131,8 @@ def make_backup(config):
         os.mkdir(dest_partial)
 
     new_state = {}
+    errors_full = []
+    errors_partial = []
     try:
         for sourcedir in source_dirs:
             plog(f"processing {sourcedir}")
@@ -141,7 +143,10 @@ def make_backup(config):
                 try:
                     fstat = os.stat(filepath)
                 except Exception as e:
-                    plog(f"ERR: file {filepath} not found (fstat)")
+                    err = f"ERR: file {filepath} not found (fstat)"
+                    errors_full.append(err)
+                    errors_partial.append(err)
+                    plog(err)
                     plog(str(e))
                     continue
                 if filepath in state:
@@ -159,15 +164,20 @@ def make_backup(config):
                             os.path.join(dest_partial, filepath[prefixlen:])
                         )
                         try:
-                            os.makedirs(os.path.dirname(destpath), exist_ok=True)
+                            os.makedirs(
+                                os.path.dirname(destpath),
+                                exist_ok=True,
+                            )
                             if os.path.exists(destpath):
                                 os.remove(destpath)
                             shutil.copy2(filepath, destpath)
                         except Exception as e:
-                            plog(
-                                f"ERR: failed to copy {filepath} => {destpath}",
-                                "partial",
+                            err = (
+                                "ERR: failed to copy "
+                                f"{filepath} => {destpath}"
                             )
+                            errors_partial.append(err)
+                            plog(err, "partial")
                             plog(str(e), "partial")
 
                         # update in full
@@ -179,10 +189,12 @@ def make_backup(config):
                                 os.remove(destpath)
                             shutil.copy2(filepath, destpath)
                         except Exception as e:
-                            plog(
-                                f"ERR: failed to copy {filepath} => {destpath}",
-                                "full",
+                            err = (
+                                "ERR: failed to copy "
+                                f"{filepath} => {destpath}"
                             )
+                            errors_full.append(err)
+                            plog(err, "full")
                             plog(str(e), "full")
                 else:
                     # new file
@@ -196,10 +208,12 @@ def make_backup(config):
                     try:
                         shutil.copy2(filepath, destpath)
                     except Exception as e:
-                        plog(
-                            f"ERR: failed to copy {filepath} => {destpath}",
-                            "partial",
+                        err = (
+                            "ERR: failed to copy "
+                            f"{filepath} => {destpath}"
                         )
+                        errors_partial.append(err)
+                        plog(err, "partial")
                         plog(str(e), "partial")
 
                     # include in full
@@ -210,10 +224,12 @@ def make_backup(config):
                     try:
                         shutil.copy2(filepath, destpath)
                     except Exception as e:
-                        plog(
-                            f"ERR: failed to copy {filepath} => {destpath}",
-                            "full",
+                        err = (
+                            "ERR: failed to copy "
+                            f"{filepath} => {destpath}"
                         )
+                        errors_full.append(err)
+                        plog(err, "full")
                         plog(str(e), "full")
                 new_state[filepath] = [
                     fstat.st_size,
@@ -223,7 +239,7 @@ def make_backup(config):
             if filepath not in new_state:
                 # file does not exist anymore
                 # remove from full
-                plog(f"-- {filepath}", "full")
+                plog(f"-- {filepath} (full)", "full")
                 destpath = os.path.normpath(
                     os.path.join(dest_full, filepath[prefixlen:])
                 )
@@ -233,7 +249,7 @@ def make_backup(config):
                     os.path.join(dest_partial, filepath[prefixlen:])
                 )
                 if os.path.exists(destpath):
-                    plog(f"-- {filepath}", "partial")
+                    plog(f"-- {filepath} (partial)", "partial")
                     remove_file(destpath, dest_partial)
     except Exception as e:
         print("interrupted by exception")
@@ -244,12 +260,23 @@ def make_backup(config):
     plog("write state")
     write_full_state(config, new_state)
 
-    # copy full state to partial folder (required for restore)
-    plog("copying full state to partial folder")
+    plog("copying state to partial folder")
     full_state_src = config["full_state_file"]
     full_state_dest = os.path.join(dest_partial, "__state.json")
+    if os.path.exists(full_state_dest):
+        os.remove(full_state_dest)
     shutil.copy2(full_state_src, full_state_dest)
     plog("done")
+
+    if errors_full:
+        plog("Errors:", "full")
+        for err in errors:
+            log(err, "full")
+
+    if errors_partial:
+        plog("Errors:", "partial")
+        for err in errors:
+            log(err, "partial")
 
     full_log.close()
     partial_log.close()
@@ -320,7 +347,10 @@ def package_data(config, destdir, max_size, timestamp):
                 filesize = fstat.st_size
                 if size > 0 and size + filesize > max_size:
                     index += 1
-                    destbase = os.path.join(destdir, f"backup-{timestamp}-part-{index}")
+                    destbase = os.path.join(
+                        destdir,
+                        f"backup-{timestamp}-part-{index}",
+                    )
                     size = 0
                 size += filesize
                 destpath = os.path.join(destbase, relpath)
@@ -363,13 +393,11 @@ def refresh_state(config):
                 fstat.st_size,
                 int(fstat.st_mtime),
             ]
+
     write_full_state(config, new_state)
-    # copy full state to partial folder (required for restore)
-    plog("copying full state to partial folder")
     full_state_src = config["full_state_file"]
     full_state_dest = os.path.join(dest_partial, "__state.json")
     shutil.copy2(full_state_src, full_state_dest)
-
     print("done")
 
 

@@ -5,11 +5,13 @@
         ],
         "excludes": [
             "..."
-        ]
+        ],
+        "is-windows": ...
     },
     "destination": {
         "directory_full": "...",
         "directory_partial": "..."
     },
-    "full_state_file": "..."
+    "full_state_file": "...",
+    "packaging_state_file": "..."
 }

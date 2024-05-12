@@ -21,7 +21,8 @@ def get_partial_log(dest_partial_base, today):
 
 
 def read_config():
-    filepath = os.path.join(base_dir(), "backup-config.json")
+    cfgfile = os.environ.get("DABBAK_CONFIG", "backup-config.json")
+    filepath = os.path.join(base_dir(), cfgfile)
     with open(filepath, encoding="utf8") as infile:
         return json.load(infile)
 
@@ -68,9 +69,12 @@ def walk(directory, excludes):
 
 def find_source_prefix(config, fullpath):
     for source_dir in config["source"]["directories"]:
-        source_dir = os.path.normpath(source_dir)
         if fullpath.startswith(source_dir):
-            return os.path.dirname(source_dir)
+            if config["source"].get("is-windows") and os.sep == "/":
+                parts = source_dir.split("\\")
+                return "\\".join(parts[:-1])
+            else:
+                return os.path.dirname(source_dir)
 
 
 def make_backup(config):
@@ -317,11 +321,22 @@ def restore(config, destdir, timestamp, source_path):
     print("done")
 
 
-def package_data(config, destdir, max_size, timestamp):
+def package_data(config, destdir, max_size, timestamp, full=False):
     print("package-data")
     if os.path.exists(destdir):
         print(f"ERR: {destdir} exists, abort")
         exit(1)
+    if full:
+        cutoff = "0000-00-00"
+    else:
+        pkg_state_file = config["packaging_state_file"]
+        pkg_state_path = os.path.join(base_dir(), pkg_state_file)
+        if os.path.exists(pkg_state_path):
+            with open(pkg_state_path, encoding="utf8") as infile:
+                data = json.load(infile)
+                cutoff = data["timestamp"]
+        else:
+            cutoff = "0000-00-00"
     index = 1
     size = 0
     destbase = os.path.join(destdir, f"backup-{timestamp}-part-{index}")
@@ -329,7 +344,7 @@ def package_data(config, destdir, max_size, timestamp):
     history = [
         h
         for h in sorted(os.listdir(partial_dir), reverse=True)
-        if h <= timestamp
+        if h <= timestamp and h > cutoff
     ]
     full_state = read_full_state_file(
         os.path.join(partial_dir, history[0], "__state.json")
@@ -339,7 +354,7 @@ def package_data(config, destdir, max_size, timestamp):
         if not prefix:
             print(f"ERR: {fullpath} could not be matched to source dirs")
             continue
-        relpath = fullpath[len(prefix)+1:]
+        relpath = fullpath[len(prefix)+1:].replace("\\", "/")
         for dirname in history:
             pathname = os.path.join(partial_dir, dirname, relpath)
             if os.path.exists(pathname):
@@ -358,8 +373,10 @@ def package_data(config, destdir, max_size, timestamp):
                 shutil.copy2(pathname, destpath)
                 print(destpath)
                 break
-        else:
-            print(f"ERR: {relpath} not found in backup")
+    pkg_state_file = config["packaging_state_file"]
+    pkg_state_path = os.path.join(base_dir(), pkg_state_file)
+    with open(pkg_state_path, "w", encoding="utf8") as outfile:
+        json.dump({"timestamp": timestamp}, outfile)
     print("done")
 
 
@@ -404,8 +421,9 @@ def refresh_state(config):
 def help():
     print("dabbak backup")
     print("dabbak restore <dest-dir> [<yyyy-mm-dd> [<source-path>]]")
-    print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>]")
+    print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>] [--full]")
     print("dabbak refresh-state")
+    print("dabbak config")
 
 
 if __name__ == "__main__":
@@ -435,6 +453,7 @@ if __name__ == "__main__":
             timestamp = args[3]
         else:
             timestamp = datetime.date.today().strftime("%Y-%m-%d")
+        full = "--full" in args
         if max_size.endswith("g"):
             max_size = int(max_size[:-1]) * 1024*1024*1024
         elif max_size.endswith("m"):
@@ -443,9 +462,11 @@ if __name__ == "__main__":
             max_size = int(max_size[:-1]) * 1024
         else:
             max_size = int(max_size)
-        package_data(config, dest_dir, max_size, timestamp)
+        package_data(config, dest_dir, max_size, timestamp, full)
     elif cmd == "refresh-state":
-       refresh_state(config)
+        refresh_state(config)
+    elif cmd == "config":
+        print(json.dumps(config, indent=2, ensure_ascii=False))
     else:
         help()
         exit(1)

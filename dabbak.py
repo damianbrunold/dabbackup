@@ -373,10 +373,11 @@ def package_data(config, destdir, max_size, timestamp, full=False):
                 shutil.copy2(pathname, destpath)
                 print(destpath)
                 break
-    pkg_state_file = config["packaging_state_file"]
-    pkg_state_path = os.path.join(base_dir(), pkg_state_file)
-    with open(pkg_state_path, "w", encoding="utf8") as outfile:
-        json.dump({"timestamp": timestamp}, outfile)
+    if full:
+        pkg_state_file = config["packaging_state_file"]
+        pkg_state_path = os.path.join(base_dir(), pkg_state_file)
+        with open(pkg_state_path, "w", encoding="utf8") as outfile:
+            json.dump({"timestamp": timestamp}, outfile)
     print("done")
 
 

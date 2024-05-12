@@ -321,9 +321,16 @@ def restore(config, destdir, timestamp, source_path):
     print("done")
 
 
-def package_data(config, destdir, max_size, timestamp, full=False):
+def package_data(
+    config,
+    destdir,
+    max_size,
+    timestamp,
+    full=False,
+    force=False,
+):
     print("package-data")
-    if os.path.exists(destdir):
+    if os.path.exists(destdir) and not force:
         print(f"ERR: {destdir} exists, abort")
         exit(1)
     if full:
@@ -369,9 +376,10 @@ def package_data(config, destdir, max_size, timestamp, full=False):
                     size = 0
                 size += filesize
                 destpath = os.path.join(destbase, relpath)
-                os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                shutil.copy2(pathname, destpath)
-                print(destpath)
+                if not os.path.exists(destpath):
+                    os.makedirs(os.path.dirname(destpath), exist_ok=True)
+                    shutil.copy2(pathname, destpath)
+                    print(destpath)
                 break
     if full:
         pkg_state_file = config["packaging_state_file"]
@@ -440,7 +448,7 @@ if __name__ == "__main__":
     elif cmd == "restore":
         dest_dir = args[1]
         source_path = ""
-        if len(args) > 2:
+        if len(args) > 2 and not args[2].startswith("--"):
             timestamp = args[2]
             if len(args) > 3:
                 source_path = args[3]
@@ -450,11 +458,10 @@ if __name__ == "__main__":
     elif cmd == "package":
         dest_dir = args[1]
         max_size = args[2].lower()
-        if len(args) > 3:
+        if len(args) > 3 and not args[3].startswith("--"):
             timestamp = args[3]
         else:
             timestamp = datetime.date.today().strftime("%Y-%m-%d")
-        full = "--full" in args
         if max_size.endswith("g"):
             max_size = int(max_size[:-1]) * 1024*1024*1024
         elif max_size.endswith("m"):
@@ -463,7 +470,14 @@ if __name__ == "__main__":
             max_size = int(max_size[:-1]) * 1024
         else:
             max_size = int(max_size)
-        package_data(config, dest_dir, max_size, timestamp, full)
+        package_data(
+            config,
+            dest_dir,
+            max_size,
+            timestamp,
+            full="--full" in args,
+            force="--force" in args,
+        )
     elif cmd == "refresh-state":
         refresh_state(config)
     elif cmd == "config":

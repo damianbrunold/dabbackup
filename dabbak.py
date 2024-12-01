@@ -61,6 +61,10 @@ def walk(directory, excludes):
         fullpath = os.path.join(directory, path)
         if fullpath in excludes:
             continue
+        if os.path.isjunction(fullpath):
+            continue
+        if os.path.islink(fullpath):
+            continue
         if os.path.isdir(fullpath):
             yield from walk(fullpath, excludes)
         elif os.path.isfile(fullpath):

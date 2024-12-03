@@ -279,12 +279,12 @@ def make_backup(config):
     if errors_full:
         plog("Errors:", "full")
         for err in errors_full:
-            log(err, "full")
+            plog(err, "full")
 
     if errors_partial:
         plog("Errors:", "partial")
         for err in errors_partial:
-            log(err, "partial")
+            plog(err, "partial")
 
     full_log.close()
     partial_log.close()

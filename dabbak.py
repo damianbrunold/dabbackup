@@ -327,7 +327,11 @@ def restore(config, destdir, timestamp, source_path):
         if not prefix:
             print(f"ERR: {fullpath} could not be matched to source dirs")
             continue
-        relpath = fullpath[len(prefix)+1:]
+        if prefix.endswith("\\") or prefix.endswith("/"):
+            prefixlen = len(prefix)
+        else:
+            prefixlen = len(prefix) + 1
+        relpath = fullpath[prefixlen:]
         for dirname in history:
             pathname = os.path.join(partial_dir, dirname, relpath)
             if os.path.exists(pathname):
@@ -381,7 +385,11 @@ def package_data(
         if not prefix:
             print(f"ERR: {fullpath} could not be matched to source dirs")
             continue
-        relpath = fullpath[len(prefix)+1:].replace("\\", "/")
+        if prefix.endswith("\\") or prefix.endswith("/"):
+            prefixlen = len(prefix)
+        else:
+            prefixlen = len(prefix) + 1
+        relpath = fullpath[prefixlen:].replace("\\", "/")
         for dirname in history:
             pathname = os.path.join(partial_dir, dirname, relpath)
             if os.path.exists(pathname):
@@ -440,7 +448,6 @@ def refresh_state(config):
             prefixlen = len(prefix)
         else:
             prefixlen = len(prefix) + 1
-
         destdir = os.path.join(dest_full, sourcedir[prefixlen:])
         prefixlen2 = len(destdir) + 1
         for filepath in walk(destdir, []):

@@ -408,10 +408,18 @@ def package_data(
 
 def refresh_state(config):
     print("refresh-state")
-    source_dirs = [
+    srcdirs = [
         os.path.normpath(path)
         for path in config["source"]["directories"]
     ]
+    source_dirs = []
+    for srcdir in srcdirs:
+        if srcdir.endswith("*"):
+            srcdir = srcdir[:-1]
+            for sdir in os.listdir(srcdir):
+                source_dirs.append(os.path.join(srcdir, sdir))
+        else:
+            source_dirs.append(srcdir)
     dest_full = os.path.normpath(
         config["destination"]["directory_full"]
     )

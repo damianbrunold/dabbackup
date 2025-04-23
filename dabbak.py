@@ -57,18 +57,23 @@ def remove_file(filepath, dest_full):
 
 
 def walk(directory, excludes):
-    for path in sorted(os.listdir(directory)):
-        fullpath = os.path.join(directory, path)
-        if fullpath in excludes:
-            continue
-        if os.path.isjunction(fullpath):
-            continue
-        if os.path.islink(fullpath):
-            continue
-        if os.path.isdir(fullpath):
-            yield from walk(fullpath, excludes)
-        elif os.path.isfile(fullpath):
-            yield fullpath
+    if os.path.isfile(directory) and directory not in excludes:
+        yield directory
+    else:
+        if directory in excludes:
+            return
+        for path in sorted(os.listdir(directory)):
+            fullpath = os.path.join(directory, path)
+            if fullpath in excludes:
+                continue
+            if os.path.isjunction(fullpath):
+                continue
+            if os.path.islink(fullpath):
+                continue
+            if os.path.isdir(fullpath):
+                yield from walk(fullpath, excludes)
+            elif os.path.isfile(fullpath):
+                yield fullpath
 
 
 def find_source_prefix(config, fullpath):
@@ -84,10 +89,18 @@ def find_source_prefix(config, fullpath):
 def make_backup(config):
     today = datetime.date.today().strftime("%Y-%m-%d")
 
-    source_dirs = [
+    srcdirs = [
         os.path.normpath(path)
         for path in config["source"]["directories"]
     ]
+    source_dirs = []
+    for srcdir in srcdirs:
+        if srcdir.endswith("*"):
+            srcdir = srcdir[:-1]
+            for sdir in os.listdir(srcdir):
+                source_dirs.append(os.path.join(srcdir, sdir))
+        else:
+            source_dirs.append(srcdir)
     source_excludes = [
         os.path.normpath(path)
         for path in config["source"]["excludes"]

@@ -159,7 +159,10 @@ def make_backup(config):
             plog(f"processing {sourcedir}")
             sourcedir = os.path.normpath(sourcedir)
             prefix = os.path.dirname(sourcedir)
-            prefixlen = len(prefix) + 1
+            if prefix.endswith("\\") or prefix.endswith("/"):
+                prefixlen = len(prefix)
+            else:
+                prefixlen = len(prefix) + 1
             for filepath in walk(sourcedir, source_excludes):
                 try:
                     fstat = os.stat(filepath)
@@ -433,7 +436,10 @@ def refresh_state(config):
     for sourcedir in source_dirs:
         sourcedir = os.path.normpath(sourcedir)
         prefix = os.path.dirname(sourcedir)
-        prefixlen = len(prefix) + 1
+        if prefix.endsdwith("\\") or prefix.endswith("/"):
+            prefixlen = len(prefix)
+        else:
+            prefixlen = len(prefix) + 1
 
         destdir = os.path.join(dest_full, sourcedir[prefixlen:])
         prefixlen2 = len(destdir) + 1

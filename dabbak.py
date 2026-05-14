@@ -160,18 +160,26 @@ def walk(directory, excludes):
 
 
 def find_source_prefix(config, fullpath):
-    """Return the parent path of the configured source dir that contains
-    `fullpath`. Handles wildcard entries (foo/*) and Windows-formatted state
-    paths read on POSIX (is-windows flag in config).
+    """Return the prefix path that, joined with a tail, reconstructs paths
+    stored under this source dir. Matches the `prefix = dirname(sourcedir)`
+    convention used by make_backup for the *expanded* source dir.
+
+    - plain source `/data/src` -> `/data` (parent of the dir itself)
+    - wildcard `/data/users/*` -> `/data/users` (the wildcard's base, which
+      is the parent of each expanded child like `/data/users/alice`)
+
+    Handles Windows-formatted state paths read on POSIX (is-windows flag).
     """
     is_windows_state = config["source"].get("is-windows") and os.sep == "/"
     sep = "\\" if is_windows_state else os.sep
     for source_dir in config["source"]["directories"]:
-        match_dir = source_dir[:-1] if source_dir.endswith("*") else source_dir
-        if not fullpath.startswith(match_dir):
-            continue
+        is_wild = source_dir.endswith("*")
+        match_dir = source_dir[:-1] if is_wild else source_dir
         match_dir = match_dir.rstrip(sep)
-        # parent of the source dir (or of the wildcard's base)
+        if fullpath != match_dir and not fullpath.startswith(match_dir + sep):
+            continue
+        if is_wild:
+            return match_dir
         idx = match_dir.rfind(sep)
         return match_dir[:idx] if idx >= 0 else match_dir
     return None

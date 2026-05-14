@@ -357,13 +357,18 @@ class RestoreTab(_BaseFrame):
             self.listbox.delete(0, "end")
             return
         partial_dir = self.app.config["destination"]["directory_partial"]
+        # Cheap variant — only reads the partial dir's child entries and
+        # one marker file per snapshot. On Windows with hundreds of
+        # snapshots this is the difference between the GUI opening in
+        # < 100ms vs many seconds, because we avoid walking files inside
+        # each dated folder just to populate a dropdown.
         try:
-            snaps = dabbak.enumerate_snapshots(
+            dates = dabbak.list_snapshot_dates(
                 os.path.normpath(partial_dir)
             )
         except Exception:
-            snaps = []
-        valid = [s["date"] for s in snaps if not s["incomplete"]]
+            dates = []
+        valid = [d for d, incomplete in dates if not incomplete]
         self.date_combo["values"] = valid
         if valid and self.date_var.get() not in valid:
             self.date_var.set(valid[0])

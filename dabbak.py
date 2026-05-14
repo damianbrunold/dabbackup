@@ -920,6 +920,42 @@ def cmd_init(name="backup-config.json", force=False):
     )
 
 
+def list_snapshot_dates(partial_dir):
+    """Fast variant of enumerate_snapshots(): returns
+    [(date_str, incomplete_bool)] sorted newest-first WITHOUT walking
+    inside each snapshot folder. One os.scandir() on the partial dir
+    plus one os.path.exists() per snapshot to check the __incomplete
+    marker. On a year of daily snapshots this is ~366 syscalls instead
+    of N*M (one stat per file in every snapshot), which matters a lot
+    on Windows where stat is expensive.
+
+    Use this when you only need dates for a dropdown / picker. Use
+    enumerate_snapshots() when you actually need file counts and sizes.
+    """
+    out = []
+    try:
+        with os.scandir(_long(partial_dir)) as it:
+            entries = list(it)
+    except (FileNotFoundError, NotADirectoryError):
+        return out
+    entries.sort(key=lambda e: e.name, reverse=True)
+    for e in entries:
+        try:
+            datetime.date.fromisoformat(e.name)
+        except ValueError:
+            continue
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        incomplete = os.path.exists(
+            _long(os.path.join(e.path, "__incomplete"))
+        )
+        out.append((e.name, incomplete))
+    return out
+
+
 def enumerate_snapshots(partial_dir):
     """Return [{date, path, file_count, total_bytes, incomplete, log}].
     Sorted newest-first. Tolerates entries that aren't valid snapshot dirs

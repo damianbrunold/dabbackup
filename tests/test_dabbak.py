@@ -795,6 +795,37 @@ class TestListAndPrune(unittest.TestCase):
         ) as f:
             f.write("log\n")
 
+    def test_list_snapshot_dates_is_cheap(self):
+        """list_snapshot_dates must NOT walk inside snapshot folders.
+        Verify by adding many files inside one snapshot and confirming
+        that doesn't change what the helper returns or (more
+        importantly) what cost it pays."""
+        self._make_snapshot("2026-05-10")
+        self._make_snapshot("2026-05-12", incomplete=True)
+        # Stuff thousands of files into 05-10 — if the function walked
+        # them, it'd take a moment. With scandir + one marker check,
+        # it stays fast.
+        snap = os.path.join(self.partial, "2026-05-10")
+        for i in range(200):
+            write_file(os.path.join(snap, "sub", f"f{i}.txt"), str(i))
+        dates = dabbak.list_snapshot_dates(self.partial)
+        self.assertEqual(
+            sorted(dates),
+            [("2026-05-10", False), ("2026-05-12", True)],
+        )
+
+    def test_list_snapshot_dates_skips_non_date_entries(self):
+        self._make_snapshot("2026-05-10")
+        os.makedirs(os.path.join(self.partial, "not-a-date"))
+        write_file(os.path.join(self.partial, "stray.log"))
+        dates = dabbak.list_snapshot_dates(self.partial)
+        self.assertEqual([d for d, _ in dates], ["2026-05-10"])
+
+    def test_list_snapshot_dates_missing_dir(self):
+        self.assertEqual(
+            dabbak.list_snapshot_dates("/nonexistent/path"), []
+        )
+
     def test_enumerate_skips_non_date_entries(self):
         self._make_snapshot("2026-05-10")
         self._make_snapshot("2026-05-11", incomplete=True)

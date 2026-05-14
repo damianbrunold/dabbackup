@@ -47,7 +47,14 @@ Live progress goes to stderr (so it never mixes with `--json` on stdout). `Progr
 
 **Reliability invariant for state.** A file's entry in `new_state` is updated ONLY when both partial and full copies succeeded. On copy failure for a *changed* file, the OLD `[size, mtime]` is carried over so the next run still sees a diff and retries. New files that fail to copy stay out of state entirely so the next run treats them as new again. This is what makes failed files self-healing across runs.
 
-**Source expansion.** A source path ending in `*` is expanded one level: e.g. `/home/users/*` becomes each immediate child directory. Excludes are absolute normalized paths and short-circuit `walk()`. Symlinks and junctions are skipped.
+**Source expansion.** A source path ending in `*` is expanded one level: e.g. `/home/users/*` becomes each immediate child directory. Symlinks and junctions are skipped.
+
+**Excludes (gitignore-flavored).** `config.source.excludes` accepts three forms, classified by `compile_excludes()`:
+- **No slash** (`__pycache__`, `*.pyc`, `node_modules`) — match against the basename of any walked path. Globs (`*`, `?`, `[…]`) are supported. This is the form you almost always want.
+- **Has slash + glob** (`**/build/*`) — match against the full path via `fnmatch`. fnmatch's `*` matches separators, so `**/foo` works.
+- **Has slash, no glob** (`/home/user/.cache`) — exact absolute-path match (legacy form, still supported).
+
+Matching is case-insensitive on Windows (via `os.path.normcase`) to mirror the filesystem.
 
 **Restore.** Given a target date, lists `dest_partial` directories in reverse order, filters to those `<= timestamp`, loads `__state.json` from the most recent one as the file manifest, then for each file walks the history newest-first and copies the first matching version found. `source_path` argument filters which files to restore by prefix.
 

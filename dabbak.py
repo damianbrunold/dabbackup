@@ -235,24 +235,76 @@ def remove_file(filepath, dest_full):
         print(f"failed to delete {filepath}")
 
 
+def compile_excludes(excludes):
+    """Compile a list of exclude entries into an `is_excluded(path)` test.
+
+    Syntax (gitignore-flavored):
+      - no slash  -> match against basename anywhere (globs allowed).
+                     `__pycache__` skips any directory of that name;
+                     `*.pyc` skips any .pyc file anywhere.
+      - has slash, has glob chars -> match against the full path via
+                     fnmatch.  `**/build/*` works because fnmatch's `*`
+                     matches path separators.
+      - has slash, no glob -> exact absolute-path match (legacy form).
+
+    fnmatch is case-insensitive on Windows (uses os.path.normcase), which
+    matches the filesystem's own behavior.
+    """
+    import fnmatch
+    basenames = []
+    fullpaths = []
+    abs_paths = set()
+    for raw in excludes:
+        has_slash = "/" in raw or "\\" in raw
+        has_glob = any(c in raw for c in "*?[")
+        if not has_slash:
+            basenames.append(raw)
+        elif has_glob:
+            fullpaths.append(raw)
+        else:
+            abs_paths.add(os.path.normpath(raw))
+
+    def is_excluded(path):
+        if path in abs_paths:
+            return True
+        base = os.path.basename(path)
+        for p in basenames:
+            if fnmatch.fnmatch(base, p):
+                return True
+        for p in fullpaths:
+            if fnmatch.fnmatch(path, p):
+                return True
+        return False
+
+    return is_excluded
+
+
 def walk(directory, excludes):
-    if fs_isfile(directory) and directory not in excludes:
-        yield directory
-    else:
-        if directory in excludes:
-            return
-        for path in sorted(fs_listdir(directory)):
-            fullpath = os.path.join(directory, path)
-            if fullpath in excludes:
-                continue
-            if fs_isjunction(fullpath):
-                continue
-            if fs_islink(fullpath):
-                continue
-            if fs_isdir(fullpath):
-                yield from walk(fullpath, excludes)
-            elif fs_isfile(fullpath):
-                yield fullpath
+    is_excluded = (
+        excludes if callable(excludes) else compile_excludes(excludes)
+    )
+    yield from _walk(directory, is_excluded)
+
+
+def _walk(directory, is_excluded):
+    if fs_isfile(directory):
+        if not is_excluded(directory):
+            yield directory
+        return
+    if is_excluded(directory):
+        return
+    for path in sorted(fs_listdir(directory)):
+        fullpath = os.path.join(directory, path)
+        if is_excluded(fullpath):
+            continue
+        if fs_isjunction(fullpath):
+            continue
+        if fs_islink(fullpath):
+            continue
+        if fs_isdir(fullpath):
+            yield from _walk(fullpath, is_excluded)
+        elif fs_isfile(fullpath):
+            yield fullpath
 
 
 def find_source_prefix(config, fullpath):
@@ -311,10 +363,8 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
         print("DRY RUN: no files will be copied, deleted, or state written")
 
     source_dirs = expand_source_dirs(config["source"]["directories"])
-    source_excludes = [
-        os.path.normpath(path)
-        for path in config["source"]["excludes"]
-    ]
+    source_excludes = list(config["source"]["excludes"])
+    is_excluded = compile_excludes(source_excludes)
     dest_full = os.path.normpath(
         config["destination"]["directory_full"]
     )
@@ -409,7 +459,7 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
         try:
             for sourcedir, prefixlen in source_prefixes:
                 plog(f"processing {sourcedir}")
-                for filepath in walk(sourcedir, source_excludes):
+                for filepath in walk(sourcedir, is_excluded):
                     try:
                         fstat = fs_stat(filepath)
                     except Exception as e:

@@ -171,6 +171,89 @@ class TestWalk(unittest.TestCase):
             ])
 
 
+class TestCompileExcludes(unittest.TestCase):
+    def test_basename_glob(self):
+        m = dabbak.compile_excludes(["*.pyc"])
+        self.assertTrue(m(os.path.join("foo", "bar.pyc")))
+        self.assertTrue(m("a.pyc"))
+        self.assertFalse(m(os.path.join("foo", "bar.py")))
+
+    def test_basename_literal(self):
+        m = dabbak.compile_excludes(["__pycache__"])
+        self.assertTrue(m(os.path.join("a", "b", "__pycache__")))
+        self.assertTrue(m("__pycache__"))
+        self.assertFalse(m(os.path.join("a", "pycache_other")))
+
+    def test_absolute_path_legacy(self):
+        m = dabbak.compile_excludes([os.path.normpath("/tmp/skip")])
+        self.assertTrue(m(os.path.normpath("/tmp/skip")))
+        self.assertFalse(m(os.path.normpath("/tmp/skipnot")))
+
+    def test_fullpath_glob(self):
+        m = dabbak.compile_excludes(["**/build/*"])
+        # fnmatch.fnmatch's `*` matches separators, so this matches paths
+        # whose last directory is `build` and that have at least one tail.
+        self.assertTrue(m(os.path.normpath("/a/b/build/x")))
+
+
+class TestWalkExcludes(unittest.TestCase):
+    def test_walk_skips_basename_glob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(os.path.join(tmp, "keep.py"))
+            write_file(os.path.join(tmp, "drop.pyc"))
+            write_file(os.path.join(tmp, "sub", "drop.pyc"))
+            got = sorted(dabbak.walk(tmp, ["*.pyc"]))
+            self.assertEqual(got, [os.path.join(tmp, "keep.py")])
+
+    def test_walk_skips_named_dir_anywhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(os.path.join(tmp, "a.py"))
+            write_file(os.path.join(tmp, "__pycache__", "x.pyc"))
+            write_file(os.path.join(tmp, "src", "__pycache__", "y.pyc"))
+            got = sorted(dabbak.walk(tmp, ["__pycache__"]))
+            self.assertEqual(got, [os.path.join(tmp, "a.py")])
+
+    def test_walk_absolute_path_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(os.path.join(tmp, "a.py"))
+            write_file(os.path.join(tmp, "skip", "x.py"))
+            got = sorted(dabbak.walk(
+                tmp, [os.path.normpath(os.path.join(tmp, "skip"))]
+            ))
+            self.assertEqual(got, [os.path.join(tmp, "a.py")])
+
+
+class TestBackupExcludeIntegration(unittest.TestCase):
+    def test_backup_skips_glob_excluded_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            config["source"]["excludes"] = ["*.pyc", "__pycache__"]
+            src = config["source"]["directories"][0]
+            full = config["destination"]["directory_full"]
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ):
+                write_file(os.path.join(src, "a.py"), "code")
+                write_file(os.path.join(src, "a.pyc"), "bytecode")
+                write_file(os.path.join(src, "pkg", "x.py"), "code")
+                write_file(
+                    os.path.join(src, "pkg", "__pycache__", "x.cpython.pyc"),
+                    "bytecode",
+                )
+                stats = dabbak.make_backup(config)
+                self.assertEqual(stats["new"], 2)  # only the .py files
+            self.assertTrue(os.path.exists(
+                os.path.join(full, "src", "a.py")
+            ))
+            self.assertFalse(os.path.exists(
+                os.path.join(full, "src", "a.pyc")
+            ))
+            self.assertFalse(os.path.exists(
+                os.path.join(full, "src", "pkg", "__pycache__")
+            ))
+
+
 class TestAtomicStateWrite(unittest.TestCase):
     def test_write_replaces_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:

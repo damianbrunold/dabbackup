@@ -6,6 +6,7 @@ specific path behavior assert against the helper's pure logic so they
 exercise the same code path on every OS; tests that need actual filesystem
 behavior use only OS-neutral primitives (tempdir + os.path.join).
 """
+import datetime
 import json
 import os
 import shutil
@@ -570,6 +571,106 @@ class TestFormatSize(unittest.TestCase):
         self.assertEqual(dabbak.format_size(500), "500 B")
         self.assertTrue(dabbak.format_size(1500).endswith("KB"))
         self.assertTrue(dabbak.format_size(2 * 1024 ** 3).endswith("GB"))
+
+
+class TestListAndPrune(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = make_config(self.tmp.name)
+        self.partial = self.config["destination"]["directory_partial"]
+
+    def _make_snapshot(self, date, files=None, incomplete=False):
+        d = os.path.join(self.partial, date)
+        os.makedirs(d, exist_ok=True)
+        for name, content in (files or {"src/a.txt": "x"}).items():
+            write_file(os.path.join(d, name), content)
+        if incomplete:
+            with open(os.path.join(d, "__incomplete"), "w") as f:
+                f.write("x")
+        with open(
+            os.path.join(self.partial, f"backup-partial-{date}.log"), "w"
+        ) as f:
+            f.write("log\n")
+
+    def test_enumerate_skips_non_date_entries(self):
+        self._make_snapshot("2026-05-10")
+        self._make_snapshot("2026-05-11", incomplete=True)
+        os.makedirs(os.path.join(self.partial, "not-a-date"))
+        snaps = dabbak.enumerate_snapshots(self.partial)
+        self.assertEqual([s["date"] for s in snaps],
+                         ["2026-05-11", "2026-05-10"])
+        self.assertTrue(snaps[0]["incomplete"])
+        self.assertFalse(snaps[1]["incomplete"])
+        self.assertEqual(snaps[0]["file_count"], 1)
+
+    def test_select_keep_last(self):
+        snaps = [
+            {"date": "2026-05-14"},
+            {"date": "2026-05-13"},
+            {"date": "2026-05-12"},
+            {"date": "2026-05-11"},
+        ]
+        td = dabbak.select_snapshots_to_prune(
+            snaps, keep_last=2,
+            today=datetime.date(2026, 5, 14),
+        )
+        # Today is always kept regardless; keep_last keeps 2 most recent.
+        # Today (2026-05-14) and 2026-05-13 remain.
+        self.assertEqual(
+            [s["date"] for s in td], ["2026-05-12", "2026-05-11"]
+        )
+
+    def test_select_keep_days(self):
+        snaps = [
+            {"date": "2026-05-14"},
+            {"date": "2026-05-13"},
+            {"date": "2026-05-10"},
+            {"date": "2026-05-01"},
+        ]
+        td = dabbak.select_snapshots_to_prune(
+            snaps, keep_days=5,
+            today=datetime.date(2026, 5, 14),
+        )
+        # Within 5 days of 2026-05-14: >= 2026-05-09. Drops 05-01 only;
+        # 05-10 and 05-13 are within window; today always kept.
+        self.assertEqual([s["date"] for s in td], ["2026-05-01"])
+
+    def test_select_combined_policies(self):
+        snaps = [{"date": f"2026-05-{d:02d}"} for d in (14, 13, 12, 11, 1)]
+        td = dabbak.select_snapshots_to_prune(
+            snaps, keep_last=2, keep_days=3,
+            today=datetime.date(2026, 5, 14),
+        )
+        # keep_last=2 -> keep 05-14, 05-13. keep_days=3 -> keep >= 05-11.
+        # Union of kept: 14, 13, 12, 11. Delete: 05-01.
+        self.assertEqual([s["date"] for s in td], ["2026-05-01"])
+
+    def test_prune_dry_run_deletes_nothing(self):
+        self._make_snapshot("2026-05-01")
+        self._make_snapshot("2026-05-14")
+        r = dabbak.cmd_prune(self.config, keep_last=1, force=False)
+        self.assertEqual(r["deleted"], [])
+        self.assertIn("2026-05-01", r["would_delete"])
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.partial, "2026-05-01"))
+        )
+
+    def test_prune_force_deletes_folder_and_log(self):
+        self._make_snapshot("2026-05-01")
+        self._make_snapshot("2026-05-14")
+        r = dabbak.cmd_prune(self.config, keep_last=1, force=True)
+        self.assertIn("2026-05-01", r["deleted"])
+        self.assertFalse(
+            os.path.isdir(os.path.join(self.partial, "2026-05-01"))
+        )
+        self.assertFalse(os.path.exists(
+            os.path.join(self.partial, "backup-partial-2026-05-01.log")
+        ))
+        # 2026-05-14 (today, depending on system date) or just newer kept
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.partial, "2026-05-14"))
+        )
 
 
 class TestRestore(unittest.TestCase):

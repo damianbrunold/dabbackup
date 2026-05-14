@@ -680,6 +680,154 @@ def package_data(
     print("done")
 
 
+def enumerate_snapshots(partial_dir):
+    """Return [{date, path, file_count, total_bytes, incomplete, log}].
+    Sorted newest-first. Tolerates entries that aren't valid snapshot dirs
+    (skips them silently — they may be the per-day log files).
+    """
+    out = []
+    if not fs_isdir(partial_dir):
+        return out
+    for name in sorted(fs_listdir(partial_dir), reverse=True):
+        full = os.path.join(partial_dir, name)
+        if not fs_isdir(full):
+            continue
+        # Names are expected to be YYYY-MM-DD; tolerate others by skipping.
+        try:
+            datetime.date.fromisoformat(name)
+        except ValueError:
+            continue
+        files = 0
+        bytes_total = 0
+        for _ in []:
+            pass
+        for path in walk(full, []):
+            base = os.path.basename(path)
+            if base in ("__state.json", "__incomplete"):
+                continue
+            try:
+                files += 1
+                bytes_total += fs_stat(path).st_size
+            except Exception:
+                pass
+        out.append({
+            "date": name,
+            "path": full,
+            "file_count": files,
+            "total_bytes": bytes_total,
+            "incomplete": fs_exists(os.path.join(full, "__incomplete")),
+            "log": os.path.join(partial_dir, f"backup-partial-{name}.log"),
+        })
+    return out
+
+
+def cmd_list(config, json_out=False):
+    snaps = enumerate_snapshots(
+        os.path.normpath(config["destination"]["directory_partial"])
+    )
+    if json_out:
+        print(json.dumps(
+            [{k: v for k, v in s.items() if k != "path"} for s in snaps],
+            indent=2,
+        ))
+        return
+    if not snaps:
+        print("no snapshots")
+        return
+    print(f"{'date':<12} {'files':>10} {'size':>10}  status")
+    for s in snaps:
+        status = "incomplete" if s["incomplete"] else "ok"
+        print(
+            f"{s['date']:<12} {s['file_count']:>10,} "
+            f"{format_size(s['total_bytes']):>10}  {status}"
+        )
+
+
+def select_snapshots_to_prune(snaps, keep_last=None, keep_days=None,
+                              today=None):
+    """Return the subset of `snaps` (newest-first) that should be deleted.
+
+    A snapshot is KEPT if it satisfies EITHER policy:
+      - within the most recent `keep_last` entries
+      - dated within the last `keep_days` days (relative to `today`)
+    Today's snapshot is always kept regardless of policy, so an in-progress
+    run can't be deleted out from under itself.
+    """
+    if keep_last is None and keep_days is None:
+        raise ValueError("must specify keep_last and/or keep_days")
+    if today is None:
+        today = datetime.date.today()
+    cutoff = None
+    if keep_days is not None:
+        cutoff = today - datetime.timedelta(days=keep_days)
+    to_delete = []
+    for i, s in enumerate(snaps):
+        if s["date"] == today.isoformat():
+            continue
+        keep = False
+        if keep_last is not None and i < keep_last:
+            keep = True
+        if cutoff is not None:
+            try:
+                if datetime.date.fromisoformat(s["date"]) >= cutoff:
+                    keep = True
+            except ValueError:
+                keep = True  # unparseable date: be safe, keep
+        if not keep:
+            to_delete.append(s)
+    return to_delete
+
+
+def cmd_prune(config, keep_last=None, keep_days=None, force=False,
+              json_out=False):
+    partial = os.path.normpath(config["destination"]["directory_partial"])
+    snaps = enumerate_snapshots(partial)
+    to_delete = select_snapshots_to_prune(
+        snaps, keep_last=keep_last, keep_days=keep_days,
+    )
+    result = {
+        "kept": [s["date"] for s in snaps
+                 if s not in to_delete],
+        "deleted": [],
+        "would_delete": [s["date"] for s in to_delete],
+        "force": force,
+    }
+    if not force:
+        if not json_out:
+            print(
+                "DRY RUN (no --force). Would delete "
+                f"{len(to_delete)} snapshot(s):"
+            )
+            for s in to_delete:
+                print(
+                    f"  {s['date']}  "
+                    f"{s['file_count']:,} files  "
+                    f"{format_size(s['total_bytes'])}"
+                )
+            print(f"Would keep {len(snaps) - len(to_delete)} snapshot(s).")
+        if json_out:
+            print(json.dumps(result, indent=2))
+        return result
+    for s in to_delete:
+        try:
+            shutil.rmtree(_long(s["path"]))
+        except Exception as e:
+            if not json_out:
+                print(f"ERR: failed to remove {s['path']}: {e}")
+            continue
+        if fs_exists(s["log"]):
+            try:
+                fs_remove(s["log"])
+            except Exception:
+                pass
+        result["deleted"].append(s["date"])
+        if not json_out:
+            print(f"deleted {s['date']}")
+    if json_out:
+        print(json.dumps(result, indent=2))
+    return result
+
+
 def refresh_state(config):
     print("refresh-state")
     source_dirs = expand_source_dirs(config["source"]["directories"])
@@ -776,6 +924,22 @@ def build_parser():
     sub.add_parser("refresh-state",
                    help="rebuild state from dest_full mirror")
     sub.add_parser("config", help="print effective config")
+
+    pl = sub.add_parser("list", help="list partial snapshots")
+    pl.add_argument("--json", action="store_true", dest="json_out")
+
+    pp2 = sub.add_parser(
+        "prune",
+        help="delete old partial snapshots by retention policy",
+    )
+    pp2.add_argument("--keep-last", type=int, default=None,
+                     help="keep the N most recent snapshots")
+    pp2.add_argument("--keep-days", type=int, default=None,
+                     help="keep snapshots within the last N days")
+    pp2.add_argument("--force", action="store_true",
+                     help="actually delete (default: dry-run)")
+    pp2.add_argument("--json", action="store_true", dest="json_out")
+
     return p
 
 
@@ -809,6 +973,21 @@ def main(argv=None):
         refresh_state(config)
     elif args.cmd == "config":
         print(json.dumps(config, indent=2, ensure_ascii=False))
+    elif args.cmd == "list":
+        cmd_list(config, json_out=args.json_out)
+    elif args.cmd == "prune":
+        if args.keep_last is None and args.keep_days is None:
+            sys.stderr.write(
+                "prune: must specify --keep-last and/or --keep-days\n"
+            )
+            sys.exit(2)
+        cmd_prune(
+            config,
+            keep_last=args.keep_last,
+            keep_days=args.keep_days,
+            force=args.force,
+            json_out=args.json_out,
+        )
 
 
 if __name__ == "__main__":

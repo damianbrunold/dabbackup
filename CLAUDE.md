@@ -43,6 +43,8 @@ python -m unittest discover -s tests   # run test suite (stdlib only)
 
 Live progress goes to stderr (so it never mixes with `--json` on stdout). `Progress` uses `len(prev_state)` and the sum of recorded sizes as denominator estimates — no pre-scan. First-ever run shows just a running tally.
 
+**Concurrency.** A per-config kernel-managed exclusive lock (`<full_state_file>.lock`, `fcntl.flock` on POSIX / `msvcrt.locking` on Windows) serializes write commands: `backup`, `refresh-state`, `prune --force`, `package`. A second invocation exits 1 with a clear message instead of corrupting state. Read-only commands (`restore`, `list`, `config`, `init`, dry-run prune) skip the lock so they can run alongside a backup. The lock auto-releases on process death (no stale-lock cleanup needed).
+
 **Retention.** `cmd_prune` deletes whole snapshot folders (and their `backup-partial-<date>.log`) based on `--keep-last N` and/or `--keep-days N` (union of policies). Today's snapshot is always kept. Dry-run unless `--force`.
 
 **Reliability invariant for state.** A file's entry in `new_state` is updated ONLY when both partial and full copies succeeded. On copy failure for a *changed* file, the OLD `[size, mtime]` is carried over so the next run still sees a diff and retries. New files that fail to copy stay out of state entirely so the next run treats them as new again. This is what makes failed files self-healing across runs.

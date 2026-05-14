@@ -933,6 +933,67 @@ class TestRestoreCLIBackCompat(unittest.TestCase):
                 ))
 
 
+class TestFileLock(unittest.TestCase):
+    def test_concurrent_acquire_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.lock")
+            with dabbak.FileLock(path):
+                with self.assertRaises(dabbak.LockHeld):
+                    with dabbak.FileLock(path):
+                        pass
+
+    def test_lock_released_after_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.lock")
+            with dabbak.FileLock(path):
+                pass
+            # Second acquire works.
+            with dabbak.FileLock(path):
+                pass
+
+    def test_lock_released_on_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.lock")
+            try:
+                with dabbak.FileLock(path):
+                    raise RuntimeError("oops")
+            except RuntimeError:
+                pass
+            with dabbak.FileLock(path):
+                pass
+
+    def test_lock_file_removed_after_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.lock")
+            with dabbak.FileLock(path):
+                self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(path))
+
+    def test_main_backup_locked(self):
+        """CLI backup is wrapped in _with_lock — a concurrent invocation
+        must exit with status 1 and not corrupt state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            src = config["source"]["directories"][0]
+            write_file(os.path.join(src, "a.txt"), "x")
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ), mock.patch.object(
+                dabbak, "read_config", return_value=config
+            ):
+                # Pre-acquire the lock from this process, then invoke main.
+                with dabbak.FileLock(dabbak.lock_path_for(config)):
+                    with self.assertRaises(SystemExit) as ctx:
+                        dabbak.main(["backup", "--quiet"])
+                    self.assertEqual(ctx.exception.code, 1)
+                # State file untouched (backup never ran).
+                self.assertFalse(os.path.exists(config["full_state_file"]))
+                # Now the lock is released; backup proceeds normally.
+                dabbak.main(["backup", "--quiet"])
+                self.assertTrue(os.path.exists(config["full_state_file"]))
+
+
 class TestInit(unittest.TestCase):
     def test_init_creates_template(self):
         with tempfile.TemporaryDirectory() as tmp:

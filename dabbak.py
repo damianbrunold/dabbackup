@@ -157,6 +157,88 @@ def fs_open(p, *args, **kwargs):
     return open(_long(p), *args, **kwargs)
 
 
+class LockHeld(Exception):
+    """Another process holds the dabbak lock for this config."""
+
+
+class FileLock:
+    """Cross-platform exclusive non-blocking file lock.
+
+    POSIX uses fcntl.flock, Windows uses msvcrt.locking. Both are
+    kernel-managed: if the holding process dies (incl. kill -9 / power
+    loss / Ctrl-C followed by interpreter crash), the OS releases the
+    lock automatically. No stale-lock cleanup required.
+
+    Used to serialize writers (backup, refresh-state, prune --force,
+    package) so cron + manual invocations can't corrupt state.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.fh = None
+
+    def __enter__(self):
+        parent = os.path.dirname(self.path)
+        if parent:
+            fs_makedirs(parent, exist_ok=True)
+        self.fh = fs_open(self.path, "a+", encoding="utf8")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            self.fh.close()
+            self.fh = None
+            raise LockHeld(
+                f"another dabbak run holds the lock at {self.path}"
+            )
+        # Best-effort diagnostic: record pid + timestamp. Not relied upon
+        # for correctness — the OS-level lock is the source of truth.
+        try:
+            self.fh.seek(0)
+            self.fh.truncate()
+            self.fh.write(
+                f"{os.getpid()}\n"
+                f"{datetime.datetime.now().isoformat()}\n"
+            )
+            self.fh.flush()
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                try:
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+            self.fh = None
+            try:
+                fs_remove(self.path)
+            except Exception:
+                # On Windows, another process may have already grabbed
+                # the file between our unlock and remove. Harmless.
+                pass
+
+
+def lock_path_for(config):
+    return config["full_state_file"] + ".lock"
+
+
 def base_dir():
     path = os.path.normpath(os.path.abspath(os.path.dirname(sys.argv[0])))
     if os.path.basename(path) == "dabbak":
@@ -1076,6 +1158,18 @@ def build_parser():
     return p
 
 
+def _with_lock(config, fn):
+    """Run fn under the per-config write lock. Exits 1 if another run
+    holds the lock. Read-only commands (restore/list/config/init) skip
+    this so they can run alongside a backup."""
+    try:
+        with FileLock(lock_path_for(config)):
+            return fn()
+    except LockHeld as e:
+        sys.stderr.write(f"ERROR: {e}\n")
+        sys.exit(1)
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     # init must not require an existing config.
@@ -1084,12 +1178,12 @@ def main(argv=None):
         return
     config = read_config()
     if args.cmd == "backup":
-        make_backup(
+        _with_lock(config, lambda: make_backup(
             config,
             dry_run=args.dry_run,
             quiet=args.quiet,
             json_out=args.json_out,
-        )
+        ))
     elif args.cmd == "restore":
         # Back-compat: the old CLI was `restore <dest> [<YYYY-MM-DD>
         # [<source-path>]]`. If `-t` wasn't given and the first positional
@@ -1109,16 +1203,16 @@ def main(argv=None):
             force=args.force,
         )
     elif args.cmd == "package":
-        package_data(
+        _with_lock(config, lambda: package_data(
             config,
             args.dest_dir,
             parse_size(args.max_size),
             args.timestamp or today_str(),
             full=args.full,
             force=args.force,
-        )
+        ))
     elif args.cmd == "refresh-state":
-        refresh_state(config)
+        _with_lock(config, lambda: refresh_state(config))
     elif args.cmd == "config":
         print(json.dumps(config, indent=2, ensure_ascii=False))
     elif args.cmd == "list":
@@ -1129,13 +1223,18 @@ def main(argv=None):
                 "prune: must specify --keep-last and/or --keep-days\n"
             )
             sys.exit(2)
-        cmd_prune(
+        prune_call = lambda: cmd_prune(
             config,
             keep_last=args.keep_last,
             keep_days=args.keep_days,
             force=args.force,
             json_out=args.json_out,
         )
+        # Dry-run prune is read-only — no lock needed; --force mutates.
+        if args.force:
+            _with_lock(config, prune_call)
+        else:
+            prune_call()
 
 
 if __name__ == "__main__":

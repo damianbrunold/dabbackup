@@ -25,6 +25,12 @@ python dabbak.py init
 python dabbak.py backup
 ```
 
+Or, for a friendlier first-time experience, open the GUI and configure / back up / restore from there:
+
+```bash
+python dabbak.py gui
+```
+
 ## Requirements
 
 - Python 3.9+ (3.12+ recommended for `os.path.isjunction` support on Windows; older versions silently skip the check)
@@ -241,6 +247,26 @@ Print the effective config as JSON. Useful for verifying what dabbak is reading 
 ```
 dabbak config
 ```
+
+---
+
+### `gui`
+
+Launch a graphical interface (Tkinter, stdlib — no extra packages).
+
+```
+dabbak gui
+```
+
+The window has three tabs:
+
+- **Backup** — shows a summary of the active config (sources, mirror path, snapshot path) and a *Run Backup* / *Dry Run* button. Output streams live into a scrollable log pane. The CLI lockfile still applies, so a second launch (or a concurrent cron run) sees a clear error rather than racing.
+- **Restore** — pick a snapshot date from the dropdown, type a name or pattern in the *Search* box (case-insensitive substring; or a glob if it contains `*`, `?`, `[`), click *Search*. Select one or more results, click *Restore Selected…*, choose a destination directory. Restored files keep their original mtimes.
+- **Settings** — add/remove source directories and exclude patterns, set the mirror / snapshots / state-file paths, *Save*. Saves atomically to the same config file the CLI uses (`backup-config.json` by default, or whatever `DABBAK_CONFIG` points at).
+
+The GUI shares everything with the CLI: same config file, same state, same lockfile. You can run scheduled `backup` from cron and use the GUI for ad-hoc restores on the same machine without anything special.
+
+On Linux, you may need to install Tk: `sudo apt install python3-tk` (Debian/Ubuntu) or the equivalent. On macOS and Windows the default Python install already ships with it.
 
 ## Common use cases
 

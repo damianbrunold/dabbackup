@@ -1168,6 +1168,11 @@ def build_parser():
                    help="rebuild state from dest_full mirror")
     sub.add_parser("config", help="print effective config")
 
+    sub.add_parser(
+        "gui",
+        help="launch the graphical interface (Tkinter)",
+    )
+
     pi = sub.add_parser(
         "init",
         help="create a config template next to dabbak.py",
@@ -1209,9 +1214,13 @@ def _with_lock(config, fn):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    # init must not require an existing config.
+    # init and gui must not require an existing config to be loadable.
     if args.cmd == "init":
         cmd_init(name=args.name, force=args.force)
+        return
+    if args.cmd == "gui":
+        import dabbak_gui
+        dabbak_gui.main()
         return
     config = read_config()
     if args.cmd == "backup":

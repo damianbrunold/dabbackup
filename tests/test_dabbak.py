@@ -730,6 +730,43 @@ class TestProgress(unittest.TestCase):
         self.assertEqual(p2.bytes_done, 300)
 
 
+class TestErrorCountInStats(unittest.TestCase):
+    def test_clean_run_has_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            src = config["source"]["directories"][0]
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ):
+                write_file(os.path.join(src, "a.txt"), "x")
+                stats = dabbak.make_backup(config)
+            self.assertEqual(stats["error_count"], 0)
+            self.assertTrue(stats["completed"])
+
+    def test_failed_copy_bumps_error_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            src = config["source"]["directories"][0]
+            write_file(os.path.join(src, "a.txt"), "x")
+            real_copy = dabbak.fs_copy2
+            state_file = config["full_state_file"]
+
+            def fail_data_copies(s, d):
+                if str(s) == state_file:
+                    return real_copy(s, d)
+                raise OSError("simulated")
+
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ), mock.patch.object(
+                dabbak, "fs_copy2", side_effect=fail_data_copies
+            ):
+                stats = dabbak.make_backup(config)
+            self.assertGreater(stats["error_count"], 0)
+
+
 class TestFormatSize(unittest.TestCase):
     def test_units(self):
         self.assertEqual(dabbak.format_size(0), "0 B")

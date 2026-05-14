@@ -260,7 +260,7 @@ dabbak gui
 
 The window has three tabs:
 
-- **Backup** — shows a summary of the active config (sources, mirror path, snapshot path) and a *Run Backup* / *Dry Run* button. Output streams live into a scrollable log pane. The CLI lockfile still applies, so a second launch (or a concurrent cron run) sees a clear error rather than racing.
+- **Backup** — shows a summary of the active config (sources, mirror path, snapshot path) and a *Run Backup* / *Dry Run* button. Output streams live into a scrollable log pane. A *Close window after successful backup* checkbox lets you start a run and walk away — the window closes only on a clean completion (no copy failures, no logged errors); any problem keeps it open so you can read the log. Dry-runs never auto-close. The CLI lockfile still applies, so a second launch (or a concurrent cron run) sees a clear error rather than racing.
 - **Restore** — pick a snapshot date from the dropdown, type a name or pattern in the *Search* box (case-insensitive substring; or a glob if it contains `*`, `?`, `[`), click *Search*. Select one or more results, click *Restore Selected…*, choose a destination directory. Restored files keep their original mtimes.
 - **Settings** — add/remove source directories and exclude patterns, set the mirror / snapshots / state-file paths, *Save*. Saves atomically to the same config file the CLI uses (`backup-config.json` by default, or whatever `DABBAK_CONFIG` points at).
 

@@ -160,6 +160,17 @@ class BackupTab(_BaseFrame):
         )
         self.clear_btn.pack(side="left", padx=4)
 
+        # "Set and forget" mode for cron-like manual runs. The window
+        # closes only on a clean run (completed, no copy failures, no
+        # logged errors) so any problem keeps it open for inspection.
+        # Dry-runs never close — those are exploratory by nature.
+        self.close_on_success_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            btns,
+            text="Close window after successful backup",
+            variable=self.close_on_success_var,
+        ).pack(side="right", padx=4)
+
         log_frame = ttk.LabelFrame(self, text="Output")
         log_frame.pack(fill="both", expand=True, padx=8, pady=8)
         self.log = scrolledtext.ScrolledText(
@@ -228,18 +239,28 @@ class BackupTab(_BaseFrame):
 
     def _run_worker(self, config, dry_run):
         out = QueueIO(self.queue, "out")
+        clean = False
         try:
             with contextlib.redirect_stdout(out):
                 try:
                     with dabbak.FileLock(dabbak.lock_path_for(config)):
-                        dabbak.make_backup(config, dry_run=dry_run)
+                        stats = dabbak.make_backup(
+                            config, dry_run=dry_run
+                        )
+                    clean = (
+                        bool(stats.get("completed"))
+                        and stats.get("failed", 0) == 0
+                        and stats.get("error_count", 0) == 0
+                    )
                 except dabbak.LockHeld as e:
                     print(f"ERROR: {e}")
         except Exception as e:
             self.queue.put(("err", f"ERROR: {e}"))
         finally:
             out.flush()
-            self.queue.put(("done", None))
+            # Carry result through to the GUI thread. Tuple shape:
+            # (clean_success_bool, dry_run_bool).
+            self.queue.put(("done", (clean, dry_run)))
 
     def _poll(self):
         try:
@@ -249,6 +270,16 @@ class BackupTab(_BaseFrame):
                     self.run_btn.config(state="normal")
                     self.dry_btn.config(state="normal")
                     self.append_log("--- done ---")
+                    clean, dry_run = msg
+                    if (
+                        clean
+                        and not dry_run
+                        and self.close_on_success_var.get()
+                    ):
+                        # Brief delay so the user sees the "--- done ---"
+                        # line; gives a chance to cancel by reading first
+                        # but is short enough not to feel laggy.
+                        self.after(800, self.app.root.destroy)
                     return
                 if msg is not None:
                     self.append_log(msg)

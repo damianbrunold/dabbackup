@@ -710,6 +710,11 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
         stats["elapsed_seconds"] = round(elapsed, 2)
         stats["completed"] = completed
         stats["dry_run"] = dry_run
+        # Total error log lines across both destination logs. May double-
+        # count errors that surface on both sides (e.g. fstat failures),
+        # but that's fine — we only ever use it as a boolean "anything
+        # went wrong?" indicator for callers like the GUI auto-close.
+        stats["error_count"] = len(errors_full) + len(errors_partial)
         plog(
             f"summary: {stats['new']} new, {stats['changed']} changed, "
             f"{stats['deleted']} deleted, {stats['unchanged']} unchanged, "

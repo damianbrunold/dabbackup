@@ -16,6 +16,14 @@ def mtime_changed(a, b):
     return abs(int(a) - int(b)) >= MTIME_TOLERANCE_SECONDS
 
 
+def format_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 def _long(path):
     """Prefix Windows absolute paths with \\\\?\\ to bypass MAX_PATH (260).
 
@@ -273,20 +281,31 @@ def make_backup(config, dry_run=False):
         new_state = {}
         errors_full = []
         errors_partial = []
+        stats = {
+            "new": 0, "changed": 0, "deleted": 0,
+            "unchanged": 0, "failed": 0, "bytes_copied": 0,
+        }
+
         def copy_into(filepath, destbase, relpath, overwrite, errors, tag):
+            """Return True on success (or in dry-run), False on failure.
+            Caller uses this to decide whether to record the file in state:
+            a failed copy must NOT be marked done, so the next run retries.
+            """
             destpath = os.path.normpath(os.path.join(destbase, relpath))
             if dry_run:
-                return
+                return True
             try:
                 fs_makedirs(os.path.dirname(destpath), exist_ok=True)
                 if overwrite and fs_exists(destpath):
                     fs_remove(destpath)
                 fs_copy2(filepath, destpath)
+                return True
             except Exception as e:
                 err = f"ERR: failed to copy {filepath} => {destpath}"
                 errors.append(err)
                 plog(err, tag)
                 plog(str(e), tag)
+                return False
 
         completed = False
         try:
@@ -310,16 +329,43 @@ def make_backup(config, dry_run=False):
                             or mtime_changed(fstat.st_mtime, orig_mtime)
                         ):
                             plog(f"** {filepath}")
-                            copy_into(filepath, dest_partial, relpath, True, errors_partial, "partial")
-                            copy_into(filepath, dest_full, relpath, True, errors_full, "full")
+                            ok_p = copy_into(filepath, dest_partial, relpath, True, errors_partial, "partial")
+                            ok_f = copy_into(filepath, dest_full, relpath, True, errors_full, "full")
+                            if ok_p and ok_f:
+                                stats["changed"] += 1
+                                stats["bytes_copied"] += fstat.st_size
+                                new_state[filepath] = [
+                                    fstat.st_size, int(fstat.st_mtime),
+                                ]
+                            else:
+                                # Preserve the OLD (size, mtime) so on the next
+                                # run the file's current stat still differs
+                                # from state and we retry the copy. Without
+                                # this carry-over, completion would write a
+                                # state without this entry and the file would
+                                # then be re-detected only as "new" (still
+                                # works, but loses history).
+                                new_state[filepath] = [orig_size, orig_mtime]
+                                stats["failed"] += 1
+                        else:
+                            stats["unchanged"] += 1
+                            new_state[filepath] = [
+                                fstat.st_size, int(fstat.st_mtime),
+                            ]
                     else:
                         plog(f"++ {filepath}")
-                        copy_into(filepath, dest_partial, relpath, False, errors_partial, "partial")
-                        copy_into(filepath, dest_full, relpath, False, errors_full, "full")
-                    new_state[filepath] = [
-                        fstat.st_size,
-                        int(fstat.st_mtime),
-                    ]
+                        ok_p = copy_into(filepath, dest_partial, relpath, False, errors_partial, "partial")
+                        ok_f = copy_into(filepath, dest_full, relpath, False, errors_full, "full")
+                        if ok_p and ok_f:
+                            stats["new"] += 1
+                            stats["bytes_copied"] += fstat.st_size
+                            new_state[filepath] = [
+                                fstat.st_size, int(fstat.st_mtime),
+                            ]
+                        else:
+                            # New file that failed to copy: leave it out of
+                            # state entirely so next run retries as "new".
+                            stats["failed"] += 1
             completed = True
         except BaseException as e:
             # BaseException catches KeyboardInterrupt too — we want consistent
@@ -346,6 +392,7 @@ def make_backup(config, dry_run=False):
                     plog(f"-- {filepath} (full)", "full")
                     if not dry_run:
                         remove_file(destpath, dest_full)
+                    stats["deleted"] += 1
                 destpath = os.path.normpath(
                     os.path.join(dest_partial, relpath)
                 )
@@ -386,6 +433,17 @@ def make_backup(config, dry_run=False):
                     f.write(datetime.datetime.now().isoformat())
             except Exception:
                 pass
+        elapsed = (
+            datetime.datetime.now()
+            - datetime.datetime.fromisoformat(now)
+        ).total_seconds()
+        plog(
+            f"summary: {stats['new']} new, {stats['changed']} changed, "
+            f"{stats['deleted']} deleted, {stats['unchanged']} unchanged, "
+            f"{stats['failed']} failed, "
+            f"{format_size(stats['bytes_copied'])} copied "
+            f"in {elapsed:.1f}s"
+        )
         plog("done")
 
         if errors_full:
@@ -397,6 +455,8 @@ def make_backup(config, dry_run=False):
             plog("Errors:", "partial")
             for err in errors_partial:
                 plog(err, "partial")
+
+        return stats
 
 
 def restore(config, destdir, timestamp, source_path):

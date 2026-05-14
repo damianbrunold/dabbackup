@@ -350,6 +350,132 @@ class TestBackupIntegration(unittest.TestCase):
                            .strftime("%Y-%m-%d"), "")
 
 
+class TestFailureSemantics(unittest.TestCase):
+    """F5/F8: a copy failure must not mark the file done in state, so the
+    next run retries it.
+    """
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.config = make_config(self.root)
+        self.src = self.config["source"]["directories"][0]
+        self._log_patch = mock.patch.object(
+            dabbak, "get_full_log",
+            return_value=os.path.join(self.root, "backup-full.log"),
+        )
+        self._log_patch.start()
+        self.addCleanup(self._log_patch.stop)
+
+    def test_new_file_copy_failure_not_recorded(self):
+        write_file(os.path.join(self.src, "a.txt"), "hello")
+        real_copy = dabbak.fs_copy2
+        state_file = self.config["full_state_file"]
+
+        def fail_data_copies(s, d):
+            # Let the post-run __state.json copy succeed; only fail data
+            # copies (those whose source is the source tree).
+            if str(s) == state_file:
+                return real_copy(s, d)
+            raise OSError("simulated copy failure")
+
+        with mock.patch.object(
+            dabbak, "fs_copy2", side_effect=fail_data_copies
+        ):
+            stats = dabbak.make_backup(self.config)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["new"], 0)
+        state = json.loads(read_file(self.config["full_state_file"]))
+        # Failed new file must NOT be in state — next run retries as "new".
+        self.assertNotIn(os.path.join(self.src, "a.txt"), state)
+
+        # Now run normally and verify retry works.
+        stats2 = dabbak.make_backup(self.config)
+        self.assertEqual(stats2["new"], 1)
+        state2 = json.loads(read_file(self.config["full_state_file"]))
+        self.assertIn(os.path.join(self.src, "a.txt"), state2)
+
+    def test_changed_file_copy_failure_preserves_old_state(self):
+        path = os.path.join(self.src, "a.txt")
+        write_file(path, "v1")
+        dabbak.make_backup(self.config)
+        old_state = json.loads(read_file(self.config["full_state_file"]))
+        old_entry = old_state[path]
+
+        # Bump mtime + content; first failed retry, then succeed.
+        st = os.stat(path)
+        os.utime(path, (st.st_atime, st.st_mtime + 10))
+        write_file(path, "v2-bigger")
+
+        real_copy = dabbak.fs_copy2
+        state_file = self.config["full_state_file"]
+
+        def fail_data_copies(s, d):
+            if str(s) == state_file:
+                return real_copy(s, d)
+            raise OSError("boom")
+
+        with mock.patch.object(
+            dabbak, "fs_copy2", side_effect=fail_data_copies
+        ):
+            stats = dabbak.make_backup(self.config)
+        self.assertEqual(stats["failed"], 1)
+        # Old entry must be preserved so we still detect a change next run.
+        mid_state = json.loads(read_file(self.config["full_state_file"]))
+        self.assertEqual(mid_state[path], old_entry)
+
+        # Real retry succeeds.
+        stats2 = dabbak.make_backup(self.config)
+        self.assertEqual(stats2["changed"], 1)
+        self.assertEqual(
+            read_file(os.path.join(
+                self.config["destination"]["directory_full"],
+                "src", "a.txt",
+            )),
+            "v2-bigger",
+        )
+
+
+class TestSummary(unittest.TestCase):
+    def test_summary_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            src = config["source"]["directories"][0]
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ):
+                write_file(os.path.join(src, "a"), "1")
+                write_file(os.path.join(src, "b"), "2")
+                s = dabbak.make_backup(config)
+                self.assertEqual(s["new"], 2)
+                self.assertEqual(s["changed"], 0)
+                self.assertEqual(s["unchanged"], 0)
+
+                # Second run: nothing changed.
+                s = dabbak.make_backup(config)
+                self.assertEqual(s["new"], 0)
+                self.assertEqual(s["unchanged"], 2)
+
+                # Change one, delete one.
+                pa = os.path.join(src, "a")
+                st = os.stat(pa)
+                os.utime(pa, (st.st_atime, st.st_mtime + 10))
+                write_file(pa, "1-changed")
+                os.remove(os.path.join(src, "b"))
+                s = dabbak.make_backup(config)
+                self.assertEqual(s["changed"], 1)
+                self.assertEqual(s["deleted"], 1)
+
+
+class TestFormatSize(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(dabbak.format_size(0), "0 B")
+        self.assertEqual(dabbak.format_size(500), "500 B")
+        self.assertTrue(dabbak.format_size(1500).endswith("KB"))
+        self.assertTrue(dabbak.format_size(2 * 1024 ** 3).endswith("GB"))
+
+
 class TestRestore(unittest.TestCase):
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:

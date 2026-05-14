@@ -793,6 +793,63 @@ class TestRestoreExtensions(unittest.TestCase):
             ))
 
 
+class TestRestoreCLIBackCompat(unittest.TestCase):
+    """The old CLI was: `restore <dest> [<YYYY-MM-DD> [<source-path>]]`.
+    The new CLI exposes `-t/--timestamp` + positional patterns. Old
+    invocations must still resolve the date as a timestamp, not as a
+    path pattern.
+    """
+
+    def test_old_positional_date_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            src = config["source"]["directories"][0]
+            cfg_path = os.path.join(tmp, "config.json")
+            with open(cfg_path, "w") as f:
+                json.dump(config, f)
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ), mock.patch.object(
+                dabbak, "read_config", return_value=config
+            ):
+                write_file(os.path.join(src, "a.txt"), "hello")
+                dabbak.make_backup(config)
+                today = datetime.date.today().isoformat()
+                target = os.path.join(tmp, "out")
+                # Old CLI form: dest then positional date
+                dabbak.main(["restore", target, today])
+                self.assertTrue(os.path.exists(
+                    os.path.join(target, "src", "a.txt")
+                ))
+
+    def test_old_positional_date_and_source_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            src = config["source"]["directories"][0]
+            with mock.patch.object(
+                dabbak, "get_full_log",
+                return_value=os.path.join(tmp, "backup-full.log"),
+            ), mock.patch.object(
+                dabbak, "read_config", return_value=config
+            ):
+                write_file(os.path.join(src, "a.txt"), "A")
+                write_file(os.path.join(src, "sub", "b.txt"), "B")
+                dabbak.make_backup(config)
+                today = datetime.date.today().isoformat()
+                target = os.path.join(tmp, "out")
+                # Old CLI form: dest, date, source-path prefix
+                dabbak.main(
+                    ["restore", target, today, os.path.join(src, "sub")]
+                )
+                self.assertFalse(os.path.exists(
+                    os.path.join(target, "src", "a.txt")
+                ))
+                self.assertTrue(os.path.exists(
+                    os.path.join(target, "src", "sub", "b.txt")
+                ))
+
+
 class TestInit(unittest.TestCase):
     def test_init_creates_template(self):
         with tempfile.TemporaryDirectory() as tmp:

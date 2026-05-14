@@ -1041,11 +1041,20 @@ def main(argv=None):
             json_out=args.json_out,
         )
     elif args.cmd == "restore":
+        # Back-compat: the old CLI was `restore <dest> [<YYYY-MM-DD>
+        # [<source-path>]]`. If `-t` wasn't given and the first positional
+        # looks like a date, accept it as the timestamp so existing scripts
+        # keep working.
+        import re as _re
+        pos = list(args.patterns)
+        ts = args.timestamp
+        if ts is None and pos and _re.fullmatch(r"\d{4}-\d{2}-\d{2}", pos[0]):
+            ts = pos.pop(0)
         restore(
             config,
             args.dest_dir,
-            args.timestamp or today_str(),
-            patterns=args.patterns,
+            ts or today_str(),
+            patterns=pos,
             dry_run=args.dry_run,
             force=args.force,
         )

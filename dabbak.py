@@ -5,6 +5,71 @@ import shutil
 import sys
 
 
+def _long(path):
+    """Prefix Windows absolute paths with \\\\?\\ to bypass MAX_PATH (260).
+
+    No-op on POSIX. Idempotent. Pass through anything falsy so callers can
+    forward args without checking.
+    """
+    if os.name != "nt" or not path:
+        return path
+    p = os.path.abspath(path)
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def fs_stat(p):
+    return os.stat(_long(p))
+
+
+def fs_exists(p):
+    return os.path.exists(_long(p))
+
+
+def fs_isdir(p):
+    return os.path.isdir(_long(p))
+
+
+def fs_isfile(p):
+    return os.path.isfile(_long(p))
+
+
+def fs_islink(p):
+    return os.path.islink(_long(p))
+
+
+def fs_isjunction(p):
+    fn = getattr(os.path, "isjunction", None)
+    return fn(_long(p)) if fn else False
+
+
+def fs_listdir(p):
+    return os.listdir(_long(p))
+
+
+def fs_makedirs(p, exist_ok=False):
+    return os.makedirs(_long(p), exist_ok=exist_ok)
+
+
+def fs_remove(p):
+    return os.remove(_long(p))
+
+
+def fs_rmdir(p):
+    return os.rmdir(_long(p))
+
+
+def fs_copy2(src, dst):
+    return shutil.copy2(_long(src), _long(dst))
+
+
+def fs_open(p, *args, **kwargs):
+    return open(_long(p), *args, **kwargs)
+
+
 def base_dir():
     path = os.path.normpath(os.path.abspath(os.path.dirname(sys.argv[0])))
     if os.path.basename(path) == "dabbak":
@@ -23,7 +88,7 @@ def get_partial_log(dest_partial_base, today):
 def read_config():
     cfgfile = os.environ.get("DABBAK_CONFIG", "backup-config.json")
     filepath = os.path.join(base_dir(), cfgfile)
-    with open(filepath, encoding="utf8") as infile:
+    with fs_open(filepath, encoding="utf8") as infile:
         return json.load(infile)
 
 
@@ -32,8 +97,8 @@ def read_full_state(config):
 
 
 def read_full_state_file(filepath):
-    if os.path.exists(filepath):
-        with open(filepath, encoding="utf8") as infile:
+    if fs_exists(filepath):
+        with fs_open(filepath, encoding="utf8") as infile:
             return json.load(infile)
     else:
         return {}
@@ -45,41 +110,41 @@ def write_full_state(config, state):
 
 def write_full_state_file(filepath, state):
     tmp = filepath + ".tmp"
-    with open(tmp, "w", encoding="utf8") as outfile:
+    with fs_open(tmp, "w", encoding="utf8") as outfile:
         json.dump(state, outfile, indent=2, ensure_ascii=False)
         outfile.flush()
         os.fsync(outfile.fileno())
-    os.replace(tmp, filepath)
+    os.replace(_long(tmp), _long(filepath))
 
 
 def remove_file(filepath, dest_full):
     try:
-        os.remove(filepath)
+        fs_remove(filepath)
         dirpath = os.path.dirname(filepath)
-        while dirpath.startswith(dest_full) and not os.listdir(dirpath):
-            os.rmdir(dirpath)
+        while dirpath.startswith(dest_full) and not fs_listdir(dirpath):
+            fs_rmdir(dirpath)
             dirpath = os.path.dirname(dirpath)
     except Exception:
         print(f"failed to delete {filepath}")
 
 
 def walk(directory, excludes):
-    if os.path.isfile(directory) and directory not in excludes:
+    if fs_isfile(directory) and directory not in excludes:
         yield directory
     else:
         if directory in excludes:
             return
-        for path in sorted(os.listdir(directory)):
+        for path in sorted(fs_listdir(directory)):
             fullpath = os.path.join(directory, path)
             if fullpath in excludes:
                 continue
-            if os.path.isjunction(fullpath):
+            if fs_isjunction(fullpath):
                 continue
-            if os.path.islink(fullpath):
+            if fs_islink(fullpath):
                 continue
-            if os.path.isdir(fullpath):
+            if fs_isdir(fullpath):
                 yield from walk(fullpath, excludes)
-            elif os.path.isfile(fullpath):
+            elif fs_isfile(fullpath):
                 yield fullpath
 
 
@@ -116,11 +181,11 @@ def expand_source_dirs(directories):
         srcdir = os.path.normpath(srcdir)
         if srcdir.endswith("*") or srcdir.endswith("*" + os.sep):
             base = srcdir.rstrip("*").rstrip(os.sep)
-            if not os.path.isdir(base):
+            if not fs_isdir(base):
                 continue
-            for name in sorted(os.listdir(base)):
+            for name in sorted(fs_listdir(base)):
                 child = os.path.join(base, name)
-                if os.path.isdir(child) and not os.path.islink(child):
+                if fs_isdir(child) and not fs_islink(child):
                     result.append(child)
         else:
             result.append(srcdir)
@@ -143,11 +208,11 @@ def make_backup(config):
     )
     dest_partial = os.path.normpath(os.path.join(dest_partial_base, today))
 
-    if not os.path.exists(dest_partial_base):
-        os.makedirs(dest_partial_base, exist_ok=True)
+    if not fs_exists(dest_partial_base):
+        fs_makedirs(dest_partial_base, exist_ok=True)
 
-    with open(get_full_log(), "a", encoding="utf8") as full_log, \
-            open(get_partial_log(dest_partial_base, today), "a", encoding="utf8") as partial_log:
+    with fs_open(get_full_log(), "a", encoding="utf8") as full_log, \
+            fs_open(get_partial_log(dest_partial_base, today), "a", encoding="utf8") as partial_log:
 
         def plog(msg, dest="full,partial"):
             if "full" in dest:
@@ -172,9 +237,9 @@ def make_backup(config):
         plog("read state")
         state = read_full_state(config)
 
-        if not os.path.exists(dest_partial):
+        if not fs_exists(dest_partial):
             plog(f"create {dest_partial}", "partial")
-            os.makedirs(dest_partial, exist_ok=True)
+            fs_makedirs(dest_partial, exist_ok=True)
 
         # Pre-compute (sourcedir, prefixlen) so deletion can look up per-file.
         source_prefixes = [
@@ -196,7 +261,7 @@ def make_backup(config):
                 plog(f"processing {sourcedir}")
                 for filepath in walk(sourcedir, source_excludes):
                     try:
-                        fstat = os.stat(filepath)
+                        fstat = fs_stat(filepath)
                     except Exception as e:
                         err = f"ERR: file {filepath} not found (fstat)"
                         errors_full.append(err)
@@ -216,13 +281,13 @@ def make_backup(config):
                                 os.path.join(dest_partial, relpath)
                             )
                             try:
-                                os.makedirs(
+                                fs_makedirs(
                                     os.path.dirname(destpath),
                                     exist_ok=True,
                                 )
-                                if os.path.exists(destpath):
-                                    os.remove(destpath)
-                                shutil.copy2(filepath, destpath)
+                                if fs_exists(destpath):
+                                    fs_remove(destpath)
+                                fs_copy2(filepath, destpath)
                             except Exception as e:
                                 err = f"ERR: failed to copy {filepath} => {destpath}"
                                 errors_partial.append(err)
@@ -232,13 +297,13 @@ def make_backup(config):
                                 os.path.join(dest_full, relpath)
                             )
                             try:
-                                os.makedirs(
+                                fs_makedirs(
                                     os.path.dirname(destpath),
                                     exist_ok=True,
                                 )
-                                if os.path.exists(destpath):
-                                    os.remove(destpath)
-                                shutil.copy2(filepath, destpath)
+                                if fs_exists(destpath):
+                                    fs_remove(destpath)
+                                fs_copy2(filepath, destpath)
                             except Exception as e:
                                 err = f"ERR: failed to copy {filepath} => {destpath}"
                                 errors_full.append(err)
@@ -250,8 +315,8 @@ def make_backup(config):
                             os.path.join(dest_partial, relpath)
                         )
                         try:
-                            os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                            shutil.copy2(filepath, destpath)
+                            fs_makedirs(os.path.dirname(destpath), exist_ok=True)
+                            fs_copy2(filepath, destpath)
                         except Exception as e:
                             err = f"ERR: failed to copy {filepath} => {destpath}"
                             errors_partial.append(err)
@@ -261,8 +326,8 @@ def make_backup(config):
                             os.path.join(dest_full, relpath)
                         )
                         try:
-                            os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                            shutil.copy2(filepath, destpath)
+                            fs_makedirs(os.path.dirname(destpath), exist_ok=True)
+                            fs_copy2(filepath, destpath)
                         except Exception as e:
                             err = f"ERR: failed to copy {filepath} => {destpath}"
                             errors_full.append(err)
@@ -294,13 +359,13 @@ def make_backup(config):
                     )
                     continue
                 destpath = os.path.normpath(os.path.join(dest_full, relpath))
-                if os.path.exists(destpath):
+                if fs_exists(destpath):
                     plog(f"-- {filepath} (full)", "full")
                     remove_file(destpath, dest_full)
                 destpath = os.path.normpath(
                     os.path.join(dest_partial, relpath)
                 )
-                if os.path.exists(destpath):
+                if fs_exists(destpath):
                     plog(f"-- {filepath} (partial)", "partial")
                     remove_file(destpath, dest_partial)
             final_state = new_state
@@ -324,12 +389,12 @@ def make_backup(config):
             plog("copying state to partial folder")
             full_state_src = config["full_state_file"]
             full_state_dest = os.path.join(dest_partial, "__state.json")
-            shutil.copy2(full_state_src, full_state_dest)
+            fs_copy2(full_state_src, full_state_dest)
         else:
             # Mark snapshot as partial so restore won't trust it as a manifest.
             marker = os.path.join(dest_partial, "__incomplete")
             try:
-                with open(marker, "w", encoding="utf8") as f:
+                with fs_open(marker, "w", encoding="utf8") as f:
                     f.write(datetime.datetime.now().isoformat())
             except Exception:
                 pass
@@ -348,16 +413,16 @@ def make_backup(config):
 
 def restore(config, destdir, timestamp, source_path):
     print("restore")
-    if os.path.exists(destdir):
+    if fs_exists(destdir):
         print(f"ERR: {destdir} exists, abort")
         exit(1)
     partial_dir = config["destination"]["directory_partial"]
     history = [
         h
-        for h in sorted(os.listdir(partial_dir), reverse=True)
+        for h in sorted(fs_listdir(partial_dir), reverse=True)
         if h <= timestamp
-        and os.path.isdir(os.path.join(partial_dir, h))
-        and not os.path.exists(
+        and fs_isdir(os.path.join(partial_dir, h))
+        and not fs_exists(
             os.path.join(partial_dir, h, "__incomplete")
         )
     ]
@@ -375,10 +440,10 @@ def restore(config, destdir, timestamp, source_path):
         relpath = fullpath[prefixlen:]
         for dirname in history:
             pathname = os.path.join(partial_dir, dirname, relpath)
-            if os.path.exists(pathname):
+            if fs_exists(pathname):
                 destpath = os.path.join(destdir, relpath)
-                os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                shutil.copy2(pathname, destpath)
+                fs_makedirs(os.path.dirname(destpath), exist_ok=True)
+                fs_copy2(pathname, destpath)
                 print(destpath)
                 break
         else:
@@ -395,7 +460,7 @@ def package_data(
     force=False,
 ):
     print("package-data")
-    if os.path.exists(destdir) and not force:
+    if fs_exists(destdir) and not force:
         print(f"ERR: {destdir} exists, abort")
         exit(1)
     if full:
@@ -403,8 +468,8 @@ def package_data(
     else:
         pkg_state_file = config["packaging_state_file"]
         pkg_state_path = os.path.join(base_dir(), pkg_state_file)
-        if os.path.exists(pkg_state_path):
-            with open(pkg_state_path, encoding="utf8") as infile:
+        if fs_exists(pkg_state_path):
+            with fs_open(pkg_state_path, encoding="utf8") as infile:
                 data = json.load(infile)
                 cutoff = data["timestamp"]
         else:
@@ -415,10 +480,10 @@ def package_data(
     partial_dir = config["destination"]["directory_partial"]
     history = [
         h
-        for h in sorted(os.listdir(partial_dir), reverse=True)
+        for h in sorted(fs_listdir(partial_dir), reverse=True)
         if h <= timestamp and h > cutoff
-        and os.path.isdir(os.path.join(partial_dir, h))
-        and not os.path.exists(
+        and fs_isdir(os.path.join(partial_dir, h))
+        and not fs_exists(
             os.path.join(partial_dir, h, "__incomplete")
         )
     ]
@@ -434,8 +499,8 @@ def package_data(
         relpath = fullpath[prefixlen:].replace("\\", "/")
         for dirname in history:
             pathname = os.path.join(partial_dir, dirname, relpath)
-            if os.path.exists(pathname):
-                fstat = os.stat(pathname)
+            if fs_exists(pathname):
+                fstat = fs_stat(pathname)
                 filesize = fstat.st_size
                 if size > 0 and size + filesize > max_size:
                     index += 1
@@ -446,15 +511,15 @@ def package_data(
                     size = 0
                 size += filesize
                 destpath = os.path.join(destbase, relpath)
-                if not os.path.exists(destpath):
-                    os.makedirs(os.path.dirname(destpath), exist_ok=True)
-                    shutil.copy2(pathname, destpath)
+                if not fs_exists(destpath):
+                    fs_makedirs(os.path.dirname(destpath), exist_ok=True)
+                    fs_copy2(pathname, destpath)
                     print(destpath)
                 break
     if full:
         pkg_state_file = config["packaging_state_file"]
         pkg_state_path = os.path.join(base_dir(), pkg_state_file)
-        with open(pkg_state_path, "w", encoding="utf8") as outfile:
+        with fs_open(pkg_state_path, "w", encoding="utf8") as outfile:
             json.dump({"timestamp": timestamp}, outfile)
     print("done")
 
@@ -476,11 +541,11 @@ def refresh_state(config):
         prefix = os.path.dirname(sourcedir)
         prefixlen = compute_prefixlen(prefix)
         destdir = os.path.join(dest_full, sourcedir[prefixlen:])
-        if not os.path.isdir(destdir):
+        if not fs_isdir(destdir):
             continue
         destdir_prefixlen = compute_prefixlen(destdir)
         for filepath in walk(destdir, []):
-            fstat = os.stat(filepath)
+            fstat = fs_stat(filepath)
             srcpath = os.path.join(sourcedir, filepath[destdir_prefixlen:])
             new_state[srcpath] = [
                 fstat.st_size,
@@ -488,10 +553,10 @@ def refresh_state(config):
             ]
 
     write_full_state(config, new_state)
-    if os.path.isdir(dest_partial):
+    if fs_isdir(dest_partial):
         full_state_src = config["full_state_file"]
         full_state_dest = os.path.join(dest_partial, "__state.json")
-        shutil.copy2(full_state_src, full_state_dest)
+        fs_copy2(full_state_src, full_state_dest)
     print("done")
 
 

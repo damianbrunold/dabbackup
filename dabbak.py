@@ -1,8 +1,19 @@
+import argparse
 import datetime
 import json
 import os
 import shutil
 import sys
+
+
+# Filesystem mtime granularity tolerance: FAT/exFAT/SMB store mtime with 2s
+# precision, so a freshly-copied file can read back with a 1-2s drift even
+# when its contents are unchanged. Treat differences below this as equal.
+MTIME_TOLERANCE_SECONDS = 2
+
+
+def mtime_changed(a, b):
+    return abs(int(a) - int(b)) >= MTIME_TOLERANCE_SECONDS
 
 
 def _long(path):
@@ -189,8 +200,10 @@ def expand_source_dirs(directories):
     return result
 
 
-def make_backup(config):
+def make_backup(config, dry_run=False):
     today = datetime.date.today().strftime("%Y-%m-%d")
+    if dry_run:
+        print("DRY RUN: no files will be copied, deleted, or state written")
 
     source_dirs = expand_source_dirs(config["source"]["directories"])
     source_excludes = [
@@ -254,6 +267,8 @@ def make_backup(config):
         errors_partial = []
         def copy_into(filepath, destbase, relpath, overwrite, errors, tag):
             destpath = os.path.normpath(os.path.join(destbase, relpath))
+            if dry_run:
+                return
             try:
                 fs_makedirs(os.path.dirname(destpath), exist_ok=True)
                 if overwrite and fs_exists(destpath):
@@ -284,7 +299,7 @@ def make_backup(config):
                         orig_size, orig_mtime = state[filepath]
                         if (
                             fstat.st_size != orig_size
-                            or int(fstat.st_mtime) != int(orig_mtime)
+                            or mtime_changed(fstat.st_mtime, orig_mtime)
                         ):
                             plog(f"** {filepath}")
                             copy_into(filepath, dest_partial, relpath, True, errors_partial, "partial")
@@ -321,13 +336,15 @@ def make_backup(config):
                 destpath = os.path.normpath(os.path.join(dest_full, relpath))
                 if fs_exists(destpath):
                     plog(f"-- {filepath} (full)", "full")
-                    remove_file(destpath, dest_full)
+                    if not dry_run:
+                        remove_file(destpath, dest_full)
                 destpath = os.path.normpath(
                     os.path.join(dest_partial, relpath)
                 )
                 if fs_exists(destpath):
                     plog(f"-- {filepath} (partial)", "partial")
-                    remove_file(destpath, dest_partial)
+                    if not dry_run:
+                        remove_file(destpath, dest_partial)
             final_state = new_state
         else:
             # Merge: preserve old state entries for paths we never reached,
@@ -343,9 +360,12 @@ def make_backup(config):
             )
 
         plog("write state")
-        write_full_state(config, final_state)
+        if not dry_run:
+            write_full_state(config, final_state)
 
-        if completed:
+        if dry_run:
+            pass
+        elif completed:
             plog("copying state to partial folder")
             full_state_src = config["full_state_file"]
             full_state_dest = os.path.join(dest_partial, "__state.json")
@@ -520,61 +540,87 @@ def refresh_state(config):
     print("done")
 
 
-def help():
-    print("dabbak backup")
-    print("dabbak restore <dest-dir> [<yyyy-mm-dd> [<source-path>]]")
-    print("dabbak package <dest-dir> <max-size> [<yyyy-mm-dd>] [--full]")
-    print("dabbak refresh-state")
-    print("dabbak config")
+def parse_size(s):
+    s = s.lower()
+    mult = 1
+    if s.endswith("g"):
+        mult = 1024 * 1024 * 1024
+        s = s[:-1]
+    elif s.endswith("m"):
+        mult = 1024 * 1024
+        s = s[:-1]
+    elif s.endswith("k"):
+        mult = 1024
+        s = s[:-1]
+    return int(s) * mult
+
+
+def today_str():
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="dabbak",
+        description="Incremental backup tool with dated partial snapshots.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pb = sub.add_parser("backup", help="run incremental backup")
+    pb.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="walk and diff but make no filesystem changes",
+    )
+
+    pr = sub.add_parser("restore", help="restore files from a snapshot")
+    pr.add_argument("dest_dir")
+    pr.add_argument("timestamp", nargs="?", default=None,
+                    help="YYYY-MM-DD (default: today)")
+    pr.add_argument("source_path", nargs="?", default="",
+                    help="filter restored files by source-path prefix")
+
+    pp = sub.add_parser("package", help="build size-chunked archives")
+    pp.add_argument("dest_dir")
+    pp.add_argument("max_size", help="bytes; suffix k/m/g supported")
+    pp.add_argument("timestamp", nargs="?", default=None)
+    pp.add_argument("--full", action="store_true",
+                    help="ignore packaging cutoff and update it after")
+    pp.add_argument("--force", action="store_true",
+                    help="proceed even if dest_dir exists")
+
+    sub.add_parser("refresh-state",
+                   help="rebuild state from dest_full mirror")
+    sub.add_parser("config", help="print effective config")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    config = read_config()
+    if args.cmd == "backup":
+        make_backup(config, dry_run=args.dry_run)
+    elif args.cmd == "restore":
+        restore(
+            config,
+            args.dest_dir,
+            args.timestamp or today_str(),
+            args.source_path,
+        )
+    elif args.cmd == "package":
+        package_data(
+            config,
+            args.dest_dir,
+            parse_size(args.max_size),
+            args.timestamp or today_str(),
+            full=args.full,
+            force=args.force,
+        )
+    elif args.cmd == "refresh-state":
+        refresh_state(config)
+    elif args.cmd == "config":
+        print(json.dumps(config, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if len(args) == 0:
-        print(base_dir())
-        help()
-        exit(1)
-    config = read_config()
-    cmd = args[0]
-    if cmd == "backup":
-        make_backup(config)
-    elif cmd == "restore":
-        dest_dir = args[1]
-        source_path = ""
-        if len(args) > 2 and not args[2].startswith("--"):
-            timestamp = args[2]
-            if len(args) > 3:
-                source_path = args[3]
-        else:
-            timestamp = datetime.date.today().strftime("%Y-%m-%d")
-        restore(config, dest_dir, timestamp, source_path)
-    elif cmd == "package":
-        dest_dir = args[1]
-        max_size = args[2].lower()
-        if len(args) > 3 and not args[3].startswith("--"):
-            timestamp = args[3]
-        else:
-            timestamp = datetime.date.today().strftime("%Y-%m-%d")
-        if max_size.endswith("g"):
-            max_size = int(max_size[:-1]) * 1024*1024*1024
-        elif max_size.endswith("m"):
-            max_size = int(max_size[:-1]) * 1024*1024
-        elif max_size.endswith("k"):
-            max_size = int(max_size[:-1]) * 1024
-        else:
-            max_size = int(max_size)
-        package_data(
-            config,
-            dest_dir,
-            max_size,
-            timestamp,
-            full="--full" in args,
-            force="--force" in args,
-        )
-    elif cmd == "refresh-state":
-        refresh_state(config)
-    elif cmd == "config":
-        print(json.dumps(config, indent=2, ensure_ascii=False))
-    else:
-        help()
-        exit(1)
+    main()

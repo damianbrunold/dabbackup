@@ -8,6 +8,7 @@ behavior use only OS-neutral primitives (tempdir + os.path.join).
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -466,6 +467,75 @@ class TestSummary(unittest.TestCase):
                 s = dabbak.make_backup(config)
                 self.assertEqual(s["changed"], 1)
                 self.assertEqual(s["deleted"], 1)
+
+
+class TestLogRotation(unittest.TestCase):
+    def test_rotate_when_large(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "big.log")
+            with open(log, "wb") as f:
+                f.write(b"x" * 200)
+            dabbak.rotate_log_if_large(log, max_bytes=100)
+            self.assertFalse(os.path.exists(log))
+            self.assertTrue(os.path.exists(log + ".1"))
+
+    def test_no_rotate_when_small(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "small.log")
+            with open(log, "wb") as f:
+                f.write(b"x" * 50)
+            dabbak.rotate_log_if_large(log, max_bytes=100)
+            self.assertTrue(os.path.exists(log))
+            self.assertFalse(os.path.exists(log + ".1"))
+
+    def test_rotate_discards_previous_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "x.log")
+            with open(log, "wb") as f:
+                f.write(b"new" * 50)
+            with open(log + ".1", "wb") as f:
+                f.write(b"OLD")
+            dabbak.rotate_log_if_large(log, max_bytes=10)
+            with open(log + ".1", "rb") as f:
+                self.assertNotEqual(f.read(), b"OLD")
+
+
+class TestVerbosity(unittest.TestCase):
+    def _run(self, **kw):
+        import io, contextlib
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        config = make_config(tmp)
+        src = config["source"]["directories"][0]
+        write_file(os.path.join(src, "a.txt"), "x")
+        write_file(os.path.join(src, "b.txt"), "y")
+        buf = io.StringIO()
+        with mock.patch.object(
+            dabbak, "get_full_log",
+            return_value=os.path.join(tmp, "backup-full.log"),
+        ), contextlib.redirect_stdout(buf):
+            dabbak.make_backup(config, **kw)
+        return buf.getvalue(), config
+
+    def test_default_prints_per_file(self):
+        out, _ = self._run()
+        self.assertIn("++", out)
+        self.assertIn("summary:", out)
+
+    def test_quiet_suppresses_per_file_but_keeps_summary(self):
+        out, _ = self._run(quiet=True)
+        self.assertNotIn("++", out)
+        self.assertIn("summary:", out)
+
+    def test_json_emits_parseable_summary(self):
+        out, _ = self._run(json_out=True)
+        # JSON object is the only thing on stdout; per-file lines suppressed.
+        self.assertNotIn("++", out)
+        self.assertNotIn("summary:", out)
+        payload = json.loads(out.strip())
+        self.assertEqual(payload["new"], 2)
+        self.assertTrue(payload["completed"])
+        self.assertIn("elapsed_seconds", payload)
 
 
 class TestFormatSize(unittest.TestCase):

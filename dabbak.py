@@ -100,6 +100,26 @@ def get_full_log():
     return os.path.join(base_dir(), "backup-full.log")
 
 
+# Max size of backup-full.log before rotation. One rotated file is kept
+# (foo.log -> foo.log.1, previous foo.log.1 discarded).
+FULL_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def rotate_log_if_large(path, max_bytes=FULL_LOG_MAX_BYTES):
+    try:
+        if not fs_exists(path):
+            return
+        if fs_stat(path).st_size < max_bytes:
+            return
+        rotated = path + ".1"
+        if fs_exists(rotated):
+            fs_remove(rotated)
+        os.replace(_long(path), _long(rotated))
+    except Exception:
+        # Rotation failure must never block a backup run.
+        pass
+
+
 def get_partial_log(dest_partial_base, today):
     return os.path.join(dest_partial_base, f"backup-partial-{today}.log")
 
@@ -216,9 +236,10 @@ def expand_source_dirs(directories):
     return result
 
 
-def make_backup(config, dry_run=False):
+def make_backup(config, dry_run=False, quiet=False, json_out=False):
     today = datetime.date.today().strftime("%Y-%m-%d")
-    if dry_run:
+    rotate_log_if_large(get_full_log())
+    if dry_run and not json_out:
         print("DRY RUN: no files will be copied, deleted, or state written")
 
     source_dirs = expand_source_dirs(config["source"]["directories"])
@@ -240,11 +261,19 @@ def make_backup(config, dry_run=False):
     with fs_open(get_full_log(), "a", encoding="utf8") as full_log, \
             fs_open(get_partial_log(dest_partial_base, today), "a", encoding="utf8") as partial_log:
 
-        def plog(msg, dest="full,partial"):
+        def plog(msg, dest="full,partial", level="info"):
+            """Log-file output is always written (audit trail). Stdout is
+            gated on verbosity: --quiet suppresses info+file events,
+            --json suppresses everything (the caller prints the JSON).
+            """
             if "full" in dest:
                 print(msg, file=full_log, flush=True)
             if "partial" in dest:
                 print(msg, file=partial_log, flush=True)
+            if json_out:
+                return
+            if quiet and level in ("info", "file"):
+                return
             print(msg)
 
         now = datetime.datetime.now().isoformat()
@@ -303,8 +332,8 @@ def make_backup(config, dry_run=False):
             except Exception as e:
                 err = f"ERR: failed to copy {filepath} => {destpath}"
                 errors.append(err)
-                plog(err, tag)
-                plog(str(e), tag)
+                plog(err, tag, level="warn")
+                plog(str(e), tag, level="warn")
                 return False
 
         completed = False
@@ -328,7 +357,7 @@ def make_backup(config, dry_run=False):
                             fstat.st_size != orig_size
                             or mtime_changed(fstat.st_mtime, orig_mtime)
                         ):
-                            plog(f"** {filepath}")
+                            plog(f"** {filepath}", level="file")
                             ok_p = copy_into(filepath, dest_partial, relpath, True, errors_partial, "partial")
                             ok_f = copy_into(filepath, dest_full, relpath, True, errors_full, "full")
                             if ok_p and ok_f:
@@ -353,7 +382,7 @@ def make_backup(config, dry_run=False):
                                 fstat.st_size, int(fstat.st_mtime),
                             ]
                     else:
-                        plog(f"++ {filepath}")
+                        plog(f"++ {filepath}", level="file")
                         ok_p = copy_into(filepath, dest_partial, relpath, False, errors_partial, "partial")
                         ok_f = copy_into(filepath, dest_full, relpath, False, errors_full, "full")
                         if ok_p and ok_f:
@@ -370,7 +399,7 @@ def make_backup(config, dry_run=False):
         except BaseException as e:
             # BaseException catches KeyboardInterrupt too — we want consistent
             # state even on Ctrl-C. Reraise after writing merged state.
-            plog(f"interrupted by exception: {e}")
+            plog(f"interrupted by exception: {e}", level="warn")
             import logging
             logging.exception("backup walk failed")
 
@@ -389,7 +418,7 @@ def make_backup(config, dry_run=False):
                     continue
                 destpath = os.path.normpath(os.path.join(dest_full, relpath))
                 if fs_exists(destpath):
-                    plog(f"-- {filepath} (full)", "full")
+                    plog(f"-- {filepath} (full)", "full", level="file")
                     if not dry_run:
                         remove_file(destpath, dest_full)
                     stats["deleted"] += 1
@@ -397,7 +426,7 @@ def make_backup(config, dry_run=False):
                     os.path.join(dest_partial, relpath)
                 )
                 if fs_exists(destpath):
-                    plog(f"-- {filepath} (partial)", "partial")
+                    plog(f"-- {filepath} (partial)", "partial", level="file")
                     if not dry_run:
                         remove_file(destpath, dest_partial)
             final_state = new_state
@@ -437,24 +466,31 @@ def make_backup(config, dry_run=False):
             datetime.datetime.now()
             - datetime.datetime.fromisoformat(now)
         ).total_seconds()
+        stats["elapsed_seconds"] = round(elapsed, 2)
+        stats["completed"] = completed
+        stats["dry_run"] = dry_run
         plog(
             f"summary: {stats['new']} new, {stats['changed']} changed, "
             f"{stats['deleted']} deleted, {stats['unchanged']} unchanged, "
             f"{stats['failed']} failed, "
             f"{format_size(stats['bytes_copied'])} copied "
-            f"in {elapsed:.1f}s"
+            f"in {elapsed:.1f}s",
+            level="summary",
         )
         plog("done")
 
         if errors_full:
-            plog("Errors:", "full")
+            plog("Errors:", "full", level="warn")
             for err in errors_full:
-                plog(err, "full")
+                plog(err, "full", level="warn")
 
         if errors_partial:
-            plog("Errors:", "partial")
+            plog("Errors:", "partial", level="warn")
             for err in errors_partial:
-                plog(err, "partial")
+                plog(err, "partial", level="warn")
+
+        if json_out:
+            print(json.dumps(stats, indent=2))
 
         return stats
 
@@ -640,6 +676,14 @@ def build_parser():
         action="store_true",
         help="walk and diff but make no filesystem changes",
     )
+    pb.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="suppress per-file output (still shows warnings + summary)",
+    )
+    pb.add_argument(
+        "--json", action="store_true", dest="json_out",
+        help="emit a JSON summary on stdout (suppresses normal output)",
+    )
 
     pr = sub.add_parser("restore", help="restore files from a snapshot")
     pr.add_argument("dest_dir")
@@ -667,7 +711,12 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     config = read_config()
     if args.cmd == "backup":
-        make_backup(config, dry_run=args.dry_run)
+        make_backup(
+            config,
+            dry_run=args.dry_run,
+            quiet=args.quiet,
+            json_out=args.json_out,
+        )
     elif args.cmd == "restore":
         restore(
             config,

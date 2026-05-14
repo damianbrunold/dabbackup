@@ -793,6 +793,35 @@ class TestRestoreExtensions(unittest.TestCase):
             ))
 
 
+class TestInit(unittest.TestCase):
+    def test_init_creates_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dabbak, "base_dir", return_value=tmp):
+                dabbak.cmd_init()
+                path = os.path.join(tmp, "backup-config.json")
+                self.assertTrue(os.path.exists(path))
+                data = json.loads(read_file(path))
+                self.assertIn("source", data)
+                self.assertIn("destination", data)
+
+    def test_init_refuses_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dabbak, "base_dir", return_value=tmp):
+                dabbak.cmd_init()
+                with self.assertRaises(SystemExit):
+                    dabbak.cmd_init()
+
+    def test_init_force_overwrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dabbak, "base_dir", return_value=tmp):
+                dabbak.cmd_init()
+                path = os.path.join(tmp, "backup-config.json")
+                with open(path, "w") as f:
+                    f.write("garbage")
+                dabbak.cmd_init(force=True)
+                json.loads(read_file(path))  # parses again
+
+
 class TestRefreshState(unittest.TestCase):
     def test_rebuilds_state_from_mirror(self):
         with tempfile.TemporaryDirectory() as tmp:

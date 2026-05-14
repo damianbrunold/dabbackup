@@ -11,8 +11,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Run from the repository root (where `dabbak.py` and the config live):
 
 ```bash
-python dabbak.py backup [--dry-run]
-python dabbak.py restore <dest-dir> [<yyyy-mm-dd> [<source-path>]]
+python dabbak.py init                                     # write a config template
+python dabbak.py backup [--dry-run] [--quiet] [--json]
+python dabbak.py restore <dest-dir> [-t <yyyy-mm-dd>] [pattern ...] [--dry-run] [--force]
+python dabbak.py list [--json]
+python dabbak.py prune --keep-last N | --keep-days N [--force] [--json]
 python dabbak.py package <dest-dir> <max-size> [<yyyy-mm-dd>] [--full] [--force]
 python dabbak.py refresh-state
 python dabbak.py config        # dump effective config
@@ -32,6 +35,17 @@ python -m unittest discover -s tests   # run test suite (stdlib only)
 **Failure semantics.** `make_backup` tracks a `completed` flag. On success: deletion pass runs, state is rewritten, `__state.json` is copied into the dated snapshot. On any exception (including `KeyboardInterrupt`): the deletion pass is **skipped**, state is **merged** (old entries for unvisited paths preserved, new/updated entries from `new_state` win), and the snapshot folder gets an `__incomplete` marker so `restore`/`package` ignore it. State is always written atomically via tmp + fsync + `os.replace`.
 
 **Windows long paths.** All filesystem syscalls go through `fs_*` wrappers that prepend `\\?\` (or `\\?\UNC\` for UNC) on Windows via `_long()`. Bare paths remain as dictionary keys in state — only the syscall site sees the prefixed form. When adding any new fs operation, use the `fs_*` wrapper, not raw `os.*` / `shutil.*`.
+
+**Stats / output.** `make_backup` accumulates a `stats` dict (new/changed/deleted/unchanged/failed counts + bytes_copied + elapsed_seconds + completed + dry_run) and returns it. Output is gated by three flags:
+- default: per-file `++ ** --` lines on stdout + summary
+- `--quiet`: warnings + summary only
+- `--json`: nothing on stdout except a JSON dump of `stats` at the end
+
+Live progress goes to stderr (so it never mixes with `--json` on stdout). `Progress` uses `len(prev_state)` and the sum of recorded sizes as denominator estimates — no pre-scan. First-ever run shows just a running tally.
+
+**Retention.** `cmd_prune` deletes whole snapshot folders (and their `backup-partial-<date>.log`) based on `--keep-last N` and/or `--keep-days N` (union of policies). Today's snapshot is always kept. Dry-run unless `--force`.
+
+**Reliability invariant for state.** A file's entry in `new_state` is updated ONLY when both partial and full copies succeeded. On copy failure for a *changed* file, the OLD `[size, mtime]` is carried over so the next run still sees a diff and retries. New files that fail to copy stay out of state entirely so the next run treats them as new again. This is what makes failed files self-healing across runs.
 
 **Source expansion.** A source path ending in `*` is expanded one level: e.g. `/home/users/*` becomes each immediate child directory. Excludes are absolute normalized paths and short-circuit `walk()`. Symlinks and junctions are skipped.
 

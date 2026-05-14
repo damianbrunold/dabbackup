@@ -717,6 +717,35 @@ def package_data(
     print("done")
 
 
+CONFIG_TEMPLATE = {
+    "source": {
+        "directories": ["/path/to/source"],
+        "excludes": [],
+    },
+    "destination": {
+        "directory_full": "/path/to/backup/full",
+        "directory_partial": "/path/to/backup/partial",
+    },
+    "full_state_file": "/path/to/state.json",
+    "packaging_state_file": "packaging-state.json",
+}
+
+
+def cmd_init(name="backup-config.json", force=False):
+    target = os.path.join(base_dir(), name)
+    if fs_exists(target) and not force:
+        print(f"ERR: {target} exists (use --force to overwrite)")
+        sys.exit(1)
+    with fs_open(target, "w", encoding="utf8") as f:
+        json.dump(CONFIG_TEMPLATE, f, indent=2)
+        f.write("\n")
+    print(f"wrote {target}")
+    print(
+        "Edit it to point at your sources and backup destinations, "
+        "then run: python dabbak.py backup"
+    )
+
+
 def enumerate_snapshots(partial_dir):
     """Return [{date, path, file_count, total_bytes, incomplete, log}].
     Sorted newest-first. Tolerates entries that aren't valid snapshot dirs
@@ -970,6 +999,15 @@ def build_parser():
                    help="rebuild state from dest_full mirror")
     sub.add_parser("config", help="print effective config")
 
+    pi = sub.add_parser(
+        "init",
+        help="create a config template next to dabbak.py",
+    )
+    pi.add_argument("--name", default="backup-config.json",
+                    help="filename to write (default: backup-config.json)")
+    pi.add_argument("--force", action="store_true",
+                    help="overwrite if the file exists")
+
     pl = sub.add_parser("list", help="list partial snapshots")
     pl.add_argument("--json", action="store_true", dest="json_out")
 
@@ -990,6 +1028,10 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    # init must not require an existing config.
+    if args.cmd == "init":
+        cmd_init(name=args.name, force=args.force)
+        return
     config = read_config()
     if args.cmd == "backup":
         make_backup(

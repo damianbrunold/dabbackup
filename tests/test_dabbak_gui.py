@@ -146,6 +146,38 @@ class TestQueueIO(unittest.TestCase):
         self.assertEqual(q.get_nowait(), ("x", "no-newline-here"))
 
 
+def _tk_available():
+    """True if tkinter loads AND a display is reachable."""
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_tk_available(), "no Tk display available")
+class TestGuiSmoke(unittest.TestCase):
+    """Catch the kind of breakage where Notebook.add() can't resolve a
+    custom tab class to a real Tk widget path (a TclError, not a Python
+    exception). Only runs when a display is available; silently skipped
+    on headless CI.
+    """
+
+    def test_app_constructs_and_tabs_are_real_frames(self):
+        import tkinter as tk
+        from tkinter import ttk
+        root = tk.Tk()
+        try:
+            app = dabbak_gui.DabbakApp(root)
+            self.assertIsInstance(app.backup_tab, ttk.Frame)
+            self.assertIsInstance(app.restore_tab, ttk.Frame)
+            self.assertIsInstance(app.settings_tab, ttk.Frame)
+        finally:
+            root.destroy()
+
+
 class TestCliGuiSubcommand(unittest.TestCase):
     def test_gui_subcommand_registered(self):
         parser = dabbak.build_parser()

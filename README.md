@@ -359,6 +359,31 @@ Each config has its own state file → its own lock → the two can run concurre
 - `backup-full.log` next to `dabbak.py` — append-only audit log, auto-rotates to `.log.1` at 10 MB.
 - `<base_dir>/<packaging_state_file>` — last `package --full` timestamp.
 
+## Copying the backup off-host (preserving mtimes)
+
+`dabbak.py backup` and `dabbak.py restore` both use `shutil.copy2`, which preserves file modification times. So the mtimes on files in `directory_full` and inside each dated snapshot match the source mtimes as of the last time those files were copied.
+
+If you ever copy `directory_full` manually — e.g. to bring a backup over to a new machine, or to clone it to a second drive — **make sure your copy tool preserves mtimes**. If it doesn't, every file gets the copy time as its new mtime. That's not data loss, but if you later turn the copied tree back into a dabbak source, the very next backup will see every file as "changed" (mtime differs from state) and re-copy every byte unnecessarily.
+
+| Platform | Use | Avoid |
+|---|---|---|
+| Linux / macOS | `rsync -a SRC/ DST/`  (preserves mtimes, perms, ownership) | plain `cp` (resets mtime) |
+| Linux / macOS | `cp -a SRC DST`  or  `cp -p` | `cp` without flags |
+| Linux / macOS, over SSH | `scp -p SRC user@host:DST`  or  `rsync -a -e ssh SRC/ user@host:DST/` | `scp` without `-p` |
+| Linux / macOS, archive form | `tar c SRC \| ssh host 'tar x -C DST'` | — |
+| Windows | `robocopy SRC DST /E /COPY:DAT /DCOPY:T`  (preserves file and directory timestamps; the defaults are usually enough but the explicit flags make it bulletproof) | `xcopy` without `/D /Y`; Explorer drag-drop across volumes |
+| Windows | `xcopy SRC DST /E /H /K /Y` *with* `/D` for incremental copies | plain `xcopy` |
+| Windows ↔ Linux | `rsync -a` (via WSL or Cygwin) | network drag-drop |
+
+Tip: a quick sanity check after copying — `ls -l --time-style=full-iso` on one or two known-old files at both the source and destination should show identical mtimes. If they show today's date at the destination, the copy didn't preserve them.
+
+If you've already done a copy that lost mtimes and you want to bring the new location back into a dabbak workflow:
+
+1. Point dabbak at the new location and run `refresh-state` to rebuild state from the mtime-reset tree (state now reflects "now").
+2. Run `backup`. The state-derived mtimes match the on-disk mtimes, so dabbak won't trigger spurious re-copies on this first run.
+
+The cost is one full re-copy step lost — the new mirror won't carry the original source mtimes, but everything from this point forward will be tracked correctly.
+
 ## Limitations
 
 - **Symlinks and junctions are skipped** silently. If you have meaningful symlinks in your backup tree, they won't be preserved.

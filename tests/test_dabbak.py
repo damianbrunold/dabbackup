@@ -435,6 +435,88 @@ class TestBackupIntegration(unittest.TestCase):
                            .strftime("%Y-%m-%d"), "")
 
 
+class TestDeletionFailure(unittest.TestCase):
+    """A failed mirror-delete must keep the state entry so the next run
+    retries, AND surface the error to the errors list. Otherwise the file
+    becomes a silent orphan in dest_full forever.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.config = make_config(self.root)
+        self.src = self.config["source"]["directories"][0]
+        self.full = self.config["destination"]["directory_full"]
+        self._log_patch = mock.patch.object(
+            dabbak, "get_full_log",
+            return_value=os.path.join(self.root, "backup-full.log"),
+        )
+        self._log_patch.start()
+        self.addCleanup(self._log_patch.stop)
+
+    def test_failed_delete_keeps_state_entry(self):
+        # First run: two files in source.
+        a = os.path.join(self.src, "a.txt")
+        b = os.path.join(self.src, "b.txt")
+        write_file(a, "A")
+        write_file(b, "B")
+        dabbak.make_backup(self.config)
+
+        # Source file b is deleted; mirror's b will be the deletion target.
+        os.remove(b)
+
+        # Force the mirror-side delete to fail.
+        real_remove = dabbak.remove_file
+
+        def boom_on_b(path, dest_full):
+            if path.endswith(os.sep + "b.txt") and dest_full == self.full:
+                return False, "simulated removal failure"
+            return real_remove(path, dest_full)
+
+        with mock.patch.object(dabbak, "remove_file", side_effect=boom_on_b):
+            stats = dabbak.make_backup(self.config)
+        self.assertEqual(stats["deleted"], 0)
+        self.assertGreaterEqual(stats["failed"], 1)
+
+        # b is still in state -> next run will try again.
+        state = json.loads(read_file(self.config["full_state_file"]))
+        self.assertIn(b, state)
+
+        # The actual file b.txt is still in dest_full because deletion
+        # failed. Next run with a working remove_file actually deletes it.
+        self.assertTrue(os.path.exists(os.path.join(self.full, "src", "b.txt")))
+        dabbak.make_backup(self.config)
+        self.assertFalse(os.path.exists(os.path.join(self.full, "src", "b.txt")))
+        state = json.loads(read_file(self.config["full_state_file"]))
+        self.assertNotIn(b, state)
+
+
+class TestRemoveFile(unittest.TestCase):
+    def test_success_prunes_empty_parents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "root")
+            deep = os.path.join(root, "a", "b", "c")
+            os.makedirs(deep)
+            target = os.path.join(deep, "x.txt")
+            write_file(target, "x")
+            ok, err = dabbak.remove_file(target, root)
+            self.assertTrue(ok)
+            self.assertIsNone(err)
+            # a/b/c chain is now empty -> pruned. root preserved.
+            self.assertTrue(os.path.exists(root))
+            self.assertFalse(os.path.exists(os.path.join(root, "a")))
+
+    def test_failure_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, err = dabbak.remove_file(
+                os.path.join(tmp, "nonexistent.txt"), tmp,
+            )
+            self.assertFalse(ok)
+            self.assertIsNotNone(err)
+            self.assertIn("failed to delete", err)
+
+
 class TestFailureSemantics(unittest.TestCase):
     """F5/F8: a copy failure must not mark the file done in state, so the
     next run retries it.

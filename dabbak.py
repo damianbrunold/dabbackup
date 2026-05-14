@@ -307,14 +307,25 @@ def write_full_state_file(filepath, state):
 
 
 def remove_file(filepath, dest_full):
+    """Remove a file and prune now-empty ancestor directories up to (but
+    not past) `dest_full`. Returns (ok, error_message). The directory
+    pruning is best-effort: failure there does not flip `ok` to False
+    since the file itself is gone, which is what the caller cares about.
+    """
     try:
         fs_remove(filepath)
-        dirpath = os.path.dirname(filepath)
-        while dirpath.startswith(dest_full) and not fs_listdir(dirpath):
+    except Exception as e:
+        return False, f"failed to delete {filepath}: {e}"
+    dirpath = os.path.dirname(filepath)
+    while dirpath.startswith(dest_full) and dirpath != dest_full:
+        try:
+            if fs_listdir(dirpath):
+                break
             fs_rmdir(dirpath)
-            dirpath = os.path.dirname(dirpath)
-    except Exception:
-        print(f"failed to delete {filepath}")
+        except Exception:
+            break
+        dirpath = os.path.dirname(dirpath)
+    return True, None
 
 
 def compile_excludes(excludes):
@@ -609,31 +620,57 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
 
         if completed:
             # Deletion pass: only safe when we successfully visited everything.
+            # If removing the mirror copy fails, we MUST keep the state entry
+            # so the next run retries — otherwise the file becomes a silent
+            # orphan in dest_full forever.
+            carry_over = {}
             for filepath in state:
                 if filepath in new_state:
                     continue
                 relpath = relpath_for(filepath)
                 if relpath is None:
                     # State entry doesn't match any current source dir — skip,
-                    # don't blindly delete using a wrong prefix.
+                    # don't blindly delete using a wrong prefix. Keep it so
+                    # the user can see it persist and clean it up.
                     plog(
-                        f"WARN: orphan state entry, not deleting: {filepath}"
+                        f"WARN: orphan state entry, not deleting: {filepath}",
+                        level="warn",
                     )
+                    carry_over[filepath] = state[filepath]
                     continue
-                destpath = os.path.normpath(os.path.join(dest_full, relpath))
-                if fs_exists(destpath):
+                full_destpath = os.path.normpath(
+                    os.path.join(dest_full, relpath)
+                )
+                full_ok = True
+                if fs_exists(full_destpath):
                     plog(f"-- {filepath} (full)", "full", level="file")
                     if not dry_run:
-                        remove_file(destpath, dest_full)
+                        full_ok, err = remove_file(full_destpath, dest_full)
+                        if not full_ok:
+                            errors_full.append(err)
+                            plog(err, "full", level="warn")
+                            stats["failed"] += 1
+                            # Keep the state entry — next run retries.
+                            carry_over[filepath] = state[filepath]
+                            continue
                     stats["deleted"] += 1
-                destpath = os.path.normpath(
+                partial_destpath = os.path.normpath(
                     os.path.join(dest_partial, relpath)
                 )
-                if fs_exists(destpath):
-                    plog(f"-- {filepath} (partial)", "partial", level="file")
+                if fs_exists(partial_destpath):
+                    plog(
+                        f"-- {filepath} (partial)", "partial", level="file"
+                    )
                     if not dry_run:
-                        remove_file(destpath, dest_partial)
-            final_state = new_state
+                        ok, err = remove_file(partial_destpath, dest_partial)
+                        if not ok:
+                            errors_partial.append(err)
+                            plog(err, "partial", level="warn")
+                            # Today's snapshot accumulating one extra file
+                            # is annoying but doesn't create a long-lived
+                            # orphan, so we don't carry state for it.
+            final_state = dict(new_state)
+            final_state.update(carry_over)
         else:
             # Merge: preserve old state entries for paths we never reached,
             # so a mid-run failure doesn't truncate state and trigger mass

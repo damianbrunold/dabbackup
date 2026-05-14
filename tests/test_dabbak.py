@@ -538,6 +538,32 @@ class TestVerbosity(unittest.TestCase):
         self.assertIn("elapsed_seconds", payload)
 
 
+class TestProgress(unittest.TestCase):
+    def test_estimate_from_prev_state(self):
+        prev = {"/a": [100, 1], "/b": [200, 2]}
+        p = dabbak.Progress(prev, enabled=True, interval=0)
+        self.assertEqual(p.files_total, 2)
+        self.assertEqual(p.bytes_total, 300)
+
+    def test_no_estimate_when_empty(self):
+        p = dabbak.Progress({}, enabled=True, interval=0)
+        self.assertEqual(p.files_total, 0)
+        self.assertEqual(p.bytes_total, 0)
+
+    def test_tick_updates_running_totals(self):
+        p = dabbak.Progress({}, enabled=False)
+        p.tick("/a", 100)
+        p.tick("/b", 200)
+        self.assertEqual(p.files_done, 0)  # disabled
+        self.assertEqual(p.bytes_done, 0)
+
+        p2 = dabbak.Progress({}, enabled=True, interval=999)
+        p2.tick("/a", 100)
+        p2.tick("/b", 200)
+        self.assertEqual(p2.files_done, 2)
+        self.assertEqual(p2.bytes_done, 300)
+
+
 class TestFormatSize(unittest.TestCase):
     def test_units(self):
         self.assertEqual(dabbak.format_size(0), "0 B")

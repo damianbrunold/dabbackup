@@ -16,6 +16,74 @@ def mtime_changed(a, b):
     return abs(int(a) - int(b)) >= MTIME_TOLERANCE_SECONDS
 
 
+class Progress:
+    """Periodic progress on stderr. Estimates totals from the previous
+    state file (len(state), sum of sizes) so we don't pay for a pre-scan.
+    On the first run the denominators are unknown and we print just the
+    running tally. Throttled to ~once per second; rendered on a single
+    line via \\r when stderr is a tty, else a heartbeat line every 30s.
+    """
+
+    def __init__(self, prev_state, enabled, interval=1.0):
+        self.files_total = len(prev_state) if prev_state else 0
+        self.bytes_total = sum(v[0] for v in prev_state.values()) if prev_state else 0
+        self.files_done = 0
+        self.bytes_done = 0
+        self.last_t = 0.0
+        self.interval = interval
+        self.enabled = enabled
+        self.is_tty = enabled and hasattr(sys.stderr, "isatty") \
+            and sys.stderr.isatty()
+        if enabled and not self.is_tty:
+            # Non-tty: write a heartbeat every 30s instead of every 1s.
+            self.interval = 30.0
+
+    def tick(self, filepath, file_size):
+        if not self.enabled:
+            return
+        self.files_done += 1
+        self.bytes_done += file_size
+        import time
+        t = time.monotonic()
+        if t - self.last_t < self.interval:
+            return
+        self.last_t = t
+        if self.files_total:
+            line = (
+                f"[{self.files_done} / ~{self.files_total} files, "
+                f"{format_size(self.bytes_done)} / "
+                f"~{format_size(self.bytes_total)}]"
+            )
+        else:
+            line = (
+                f"[{self.files_done} files, "
+                f"{format_size(self.bytes_done)}]"
+            )
+        tail = filepath
+        if self.is_tty:
+            try:
+                width = os.get_terminal_size(sys.stderr.fileno()).columns
+            except (OSError, ValueError):
+                width = 80
+            msg = f"{line} {tail}"
+            if len(msg) > width - 1:
+                msg = msg[:width - 1]
+            sys.stderr.write("\r" + msg + " " * (width - len(msg) - 1))
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(f"{line} {tail}\n")
+            sys.stderr.flush()
+
+    def done(self):
+        if self.enabled and self.is_tty:
+            try:
+                width = os.get_terminal_size(sys.stderr.fileno()).columns
+            except (OSError, ValueError):
+                width = 80
+            sys.stderr.write("\r" + " " * (width - 1) + "\r")
+            sys.stderr.flush()
+
+
 def format_size(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -336,6 +404,7 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
                 plog(str(e), tag, level="warn")
                 return False
 
+        progress = Progress(state, enabled=not json_out)
         completed = False
         try:
             for sourcedir, prefixlen in source_prefixes:
@@ -347,9 +416,10 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
                         err = f"ERR: file {filepath} not found (fstat)"
                         errors_full.append(err)
                         errors_partial.append(err)
-                        plog(err)
-                        plog(str(e))
+                        plog(err, level="warn")
+                        plog(str(e), level="warn")
                         continue
+                    progress.tick(filepath, fstat.st_size)
                     relpath = filepath[prefixlen:]
                     if filepath in state:
                         orig_size, orig_mtime = state[filepath]
@@ -396,7 +466,9 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
                             # state entirely so next run retries as "new".
                             stats["failed"] += 1
             completed = True
+            progress.done()
         except BaseException as e:
+            progress.done()
             # BaseException catches KeyboardInterrupt too — we want consistent
             # state even on Ctrl-C. Reraise after writing merged state.
             plog(f"interrupted by exception: {e}", level="warn")

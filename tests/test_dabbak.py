@@ -346,7 +346,7 @@ class TestBackupIntegration(unittest.TestCase):
         # Restore must error out cleanly (history is empty) rather than
         # trusting the incomplete snapshot's __state.json.
         destdir = os.path.join(self.root, "restore-target")
-        with self.assertRaises(IndexError):
+        with self.assertRaises(SystemExit):
             dabbak.restore(self.config, destdir,
                            __import__("datetime").date.today()
                            .strftime("%Y-%m-%d"), "")
@@ -701,6 +701,96 @@ class TestRestore(unittest.TestCase):
                     ),
                     "world",
                 )
+
+
+class TestRestoreExtensions(unittest.TestCase):
+    """Q3: --dry-run, --force, glob patterns."""
+
+    def _setup(self, tmp):
+        config = make_config(tmp)
+        src = config["source"]["directories"][0]
+        with mock.patch.object(
+            dabbak, "get_full_log",
+            return_value=os.path.join(tmp, "backup-full.log"),
+        ):
+            write_file(os.path.join(src, "a.txt"), "A")
+            write_file(os.path.join(src, "sub", "b.txt"), "B")
+            write_file(os.path.join(src, "sub", "c.log"), "C")
+            dabbak.make_backup(config)
+        return config, src
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, _ = self._setup(tmp)
+            target = os.path.join(tmp, "out")
+            dabbak.restore(config, target, datetime.date.today().isoformat(),
+                           patterns=[], dry_run=True)
+            self.assertFalse(os.path.exists(target))
+
+    def test_force_into_existing_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, _ = self._setup(tmp)
+            target = os.path.join(tmp, "out")
+            os.makedirs(target)
+            write_file(os.path.join(target, "preexisting"), "x")
+            # Without force this would sys.exit.
+            dabbak.restore(config, target, datetime.date.today().isoformat(),
+                           patterns=[], force=True)
+            self.assertTrue(os.path.exists(
+                os.path.join(target, "src", "a.txt")
+            ))
+            # preexisting file untouched
+            self.assertEqual(
+                read_file(os.path.join(target, "preexisting")), "x"
+            )
+
+    def test_existing_dir_refused_without_force(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, _ = self._setup(tmp)
+            target = os.path.join(tmp, "out")
+            os.makedirs(target)
+            with self.assertRaises(SystemExit):
+                dabbak.restore(
+                    config, target,
+                    datetime.date.today().isoformat(),
+                    patterns=[],
+                )
+
+    def test_glob_pattern(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, src = self._setup(tmp)
+            target = os.path.join(tmp, "out")
+            dabbak.restore(
+                config, target, datetime.date.today().isoformat(),
+                patterns=["*.txt"],
+            )
+            # b.txt under sub/ matches *.txt? fnmatchcase: "*" matches /
+            # too, so any path ending in .txt qualifies — both a.txt and
+            # sub/b.txt match. c.log does NOT.
+            self.assertTrue(os.path.exists(
+                os.path.join(target, "src", "a.txt")
+            ))
+            self.assertTrue(os.path.exists(
+                os.path.join(target, "src", "sub", "b.txt")
+            ))
+            self.assertFalse(os.path.exists(
+                os.path.join(target, "src", "sub", "c.log")
+            ))
+
+    def test_prefix_pattern_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, src = self._setup(tmp)
+            target = os.path.join(tmp, "out")
+            dabbak.restore(
+                config, target, datetime.date.today().isoformat(),
+                patterns=[os.path.join(src, "sub")],
+            )
+            self.assertFalse(os.path.exists(
+                os.path.join(target, "src", "a.txt")
+            ))
+            self.assertTrue(os.path.exists(
+                os.path.join(target, "src", "sub", "b.txt")
+            ))
 
 
 class TestRefreshState(unittest.TestCase):

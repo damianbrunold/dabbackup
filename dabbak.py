@@ -567,11 +567,34 @@ def make_backup(config, dry_run=False, quiet=False, json_out=False):
         return stats
 
 
-def restore(config, destdir, timestamp, source_path):
-    print("restore")
-    if fs_exists(destdir):
-        print(f"ERR: {destdir} exists, abort")
-        exit(1)
+def _path_matches(fullpath, patterns):
+    """Match a fullpath against a list of patterns. Each pattern is:
+      - a glob (contains *, ?, or [) -> fnmatch against the full path
+      - otherwise a prefix match (legacy behavior)
+    Empty patterns list matches everything.
+    """
+    import fnmatch
+    if not patterns:
+        return True
+    for pat in patterns:
+        if any(c in pat for c in "*?["):
+            if fnmatch.fnmatchcase(fullpath, pat):
+                return True
+        else:
+            if fullpath.startswith(pat):
+                return True
+    return False
+
+
+def restore(config, destdir, timestamp, patterns=None,
+            dry_run=False, force=False):
+    print("restore" + (" (dry-run)" if dry_run else ""))
+    if isinstance(patterns, str):
+        patterns = [patterns] if patterns else []
+    patterns = patterns or []
+    if fs_exists(destdir) and not force and not dry_run:
+        print(f"ERR: {destdir} exists, abort (use --force to merge into it)")
+        sys.exit(1)
     partial_dir = config["destination"]["directory_partial"]
     history = [
         h
@@ -582,11 +605,16 @@ def restore(config, destdir, timestamp, source_path):
             os.path.join(partial_dir, h, "__incomplete")
         )
     ]
+    if not history:
+        print(f"ERR: no usable snapshot at or before {timestamp}")
+        sys.exit(1)
     full_state = read_full_state_file(
         os.path.join(partial_dir, history[0], "__state.json")
     )
+    restored = 0
+    missing = 0
     for fullpath in full_state:
-        if not fullpath.startswith(source_path):
+        if not _path_matches(fullpath, patterns):
             continue
         prefix = find_source_prefix(config, fullpath)
         if not prefix:
@@ -598,13 +626,22 @@ def restore(config, destdir, timestamp, source_path):
             pathname = os.path.join(partial_dir, dirname, relpath)
             if fs_exists(pathname):
                 destpath = os.path.join(destdir, relpath)
-                fs_makedirs(os.path.dirname(destpath), exist_ok=True)
-                fs_copy2(pathname, destpath)
-                print(destpath)
+                if dry_run:
+                    print(f"DRY {destpath}  <-  {dirname}/{relpath}")
+                else:
+                    fs_makedirs(os.path.dirname(destpath), exist_ok=True)
+                    fs_copy2(pathname, destpath)
+                    print(destpath)
+                restored += 1
                 break
         else:
             print(f"ERR: {relpath} not found in backup")
-    print("done")
+            missing += 1
+    print(
+        f"done: {restored} file(s) "
+        f"{'would be ' if dry_run else ''}restored"
+        + (f", {missing} missing" if missing else "")
+    )
 
 
 def package_data(
@@ -907,10 +944,18 @@ def build_parser():
 
     pr = sub.add_parser("restore", help="restore files from a snapshot")
     pr.add_argument("dest_dir")
-    pr.add_argument("timestamp", nargs="?", default=None,
+    pr.add_argument("--timestamp", "-t", default=None,
                     help="YYYY-MM-DD (default: today)")
-    pr.add_argument("source_path", nargs="?", default="",
-                    help="filter restored files by source-path prefix")
+    pr.add_argument(
+        "patterns", nargs="*",
+        help="one or more path filters: a prefix, or a glob "
+             "(*, ?, [..]) matched against the full source path. "
+             "Omit to restore everything in the snapshot.",
+    )
+    pr.add_argument("--dry-run", action="store_true",
+                    help="show what would be restored, do not copy")
+    pr.add_argument("--force", action="store_true",
+                    help="allow merging into an existing dest dir")
 
     pp = sub.add_parser("package", help="build size-chunked archives")
     pp.add_argument("dest_dir")
@@ -958,7 +1003,9 @@ def main(argv=None):
             config,
             args.dest_dir,
             args.timestamp or today_str(),
-            args.source_path,
+            patterns=args.patterns,
+            dry_run=args.dry_run,
+            force=args.force,
         )
     elif args.cmd == "package":
         package_data(

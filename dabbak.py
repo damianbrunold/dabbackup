@@ -149,23 +149,20 @@ def walk(directory, excludes):
 
 
 def find_source_prefix(config, fullpath):
+    """Return the parent path of the configured source dir that contains
+    `fullpath`. Handles wildcard entries (foo/*) and Windows-formatted state
+    paths read on POSIX (is-windows flag in config).
+    """
     is_windows_state = config["source"].get("is-windows") and os.sep == "/"
+    sep = "\\" if is_windows_state else os.sep
     for source_dir in config["source"]["directories"]:
-        match_dir = source_dir
-        if match_dir.endswith("*"):
-            match_dir = match_dir[:-1]
-        if is_windows_state:
-            if not fullpath.startswith(match_dir):
-                continue
-            parts = source_dir.split("\\")
-            if source_dir.endswith("*"):
-                return "\\".join(parts[:-1]).rstrip("\\")
-            return "\\".join(parts[:-1])
+        match_dir = source_dir[:-1] if source_dir.endswith("*") else source_dir
         if not fullpath.startswith(match_dir):
             continue
-        if source_dir.endswith("*"):
-            return os.path.dirname(match_dir.rstrip(os.sep))
-        return os.path.dirname(source_dir)
+        match_dir = match_dir.rstrip(sep)
+        # parent of the source dir (or of the wildcard's base)
+        idx = match_dir.rfind(sep)
+        return match_dir[:idx] if idx >= 0 else match_dir
     return None
 
 
@@ -255,6 +252,19 @@ def make_backup(config):
         new_state = {}
         errors_full = []
         errors_partial = []
+        def copy_into(filepath, destbase, relpath, overwrite, errors, tag):
+            destpath = os.path.normpath(os.path.join(destbase, relpath))
+            try:
+                fs_makedirs(os.path.dirname(destpath), exist_ok=True)
+                if overwrite and fs_exists(destpath):
+                    fs_remove(destpath)
+                fs_copy2(filepath, destpath)
+            except Exception as e:
+                err = f"ERR: failed to copy {filepath} => {destpath}"
+                errors.append(err)
+                plog(err, tag)
+                plog(str(e), tag)
+
         completed = False
         try:
             for sourcedir, prefixlen in source_prefixes:
@@ -277,62 +287,12 @@ def make_backup(config):
                             or int(fstat.st_mtime) != int(orig_mtime)
                         ):
                             plog(f"** {filepath}")
-                            destpath = os.path.normpath(
-                                os.path.join(dest_partial, relpath)
-                            )
-                            try:
-                                fs_makedirs(
-                                    os.path.dirname(destpath),
-                                    exist_ok=True,
-                                )
-                                if fs_exists(destpath):
-                                    fs_remove(destpath)
-                                fs_copy2(filepath, destpath)
-                            except Exception as e:
-                                err = f"ERR: failed to copy {filepath} => {destpath}"
-                                errors_partial.append(err)
-                                plog(err, "partial")
-                                plog(str(e), "partial")
-                            destpath = os.path.normpath(
-                                os.path.join(dest_full, relpath)
-                            )
-                            try:
-                                fs_makedirs(
-                                    os.path.dirname(destpath),
-                                    exist_ok=True,
-                                )
-                                if fs_exists(destpath):
-                                    fs_remove(destpath)
-                                fs_copy2(filepath, destpath)
-                            except Exception as e:
-                                err = f"ERR: failed to copy {filepath} => {destpath}"
-                                errors_full.append(err)
-                                plog(err, "full")
-                                plog(str(e), "full")
+                            copy_into(filepath, dest_partial, relpath, True, errors_partial, "partial")
+                            copy_into(filepath, dest_full, relpath, True, errors_full, "full")
                     else:
                         plog(f"++ {filepath}")
-                        destpath = os.path.normpath(
-                            os.path.join(dest_partial, relpath)
-                        )
-                        try:
-                            fs_makedirs(os.path.dirname(destpath), exist_ok=True)
-                            fs_copy2(filepath, destpath)
-                        except Exception as e:
-                            err = f"ERR: failed to copy {filepath} => {destpath}"
-                            errors_partial.append(err)
-                            plog(err, "partial")
-                            plog(str(e), "partial")
-                        destpath = os.path.normpath(
-                            os.path.join(dest_full, relpath)
-                        )
-                        try:
-                            fs_makedirs(os.path.dirname(destpath), exist_ok=True)
-                            fs_copy2(filepath, destpath)
-                        except Exception as e:
-                            err = f"ERR: failed to copy {filepath} => {destpath}"
-                            errors_full.append(err)
-                            plog(err, "full")
-                            plog(str(e), "full")
+                        copy_into(filepath, dest_partial, relpath, False, errors_partial, "partial")
+                        copy_into(filepath, dest_full, relpath, False, errors_full, "full")
                     new_state[filepath] = [
                         fstat.st_size,
                         int(fstat.st_mtime),

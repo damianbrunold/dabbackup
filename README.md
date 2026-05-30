@@ -351,7 +351,7 @@ Each config has its own state file → its own lock → the two can run concurre
 - **Snapshot layout**: same shape as the mirror, but only files that changed on that day. Plus a `__state.json` file capturing the manifest for that point in time.
 - **Restore** loads `__state.json` from the requested date's snapshot as the manifest, then for each listed file searches the snapshot history newest-first for the most recent copy.
 - **Failure semantics**: any exception (or Ctrl-C) during the walk skips the deletion pass and merges state instead of overwriting it, so the next run resumes cleanly. The interrupted snapshot folder is marked `__incomplete` and ignored by restore/package.
-- **Concurrency**: every write command (`backup`, `package`, `refresh-state`, `prune --force`) acquires a per-config lock at `<full_state_file>.lock`. The dabscm runtime offers no kernel lock, so this is a best-effort *existence* lock: a second run sees a clear error instead of racing, but unlike the Python version it does **not** auto-release on process death — a crashed run leaves a stale `.lock` you must remove by hand.
+- **Concurrency**: every write command (`backup`, `package`, `refresh-state`, `prune --force`) acquires a per-config kernel advisory lock at `<full_state_file>.lock` (via dabscm's `file-lock` primitive). A second run sees a clear error instead of racing, and the OS releases the lock automatically when the process exits — so a crash never leaves a stale lock (the leftover empty `.lock` file is harmless).
 - **Windows long paths**: handled inside the `(scm fs)` primitives, so >260-char paths work natively with no `\\?\` plumbing in the tool itself.
 
 ## Files dabbak writes

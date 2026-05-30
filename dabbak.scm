@@ -15,16 +15,15 @@
 ;; JSON state format ({path: [size, seconds]}), same snapshot layout
 ;; (dated dirs + __state.json + __incomplete marker), same CLI surface.
 ;;
-;; Differences forced by the runtime: the per-config lock is a best-effort
-;; existence lock (the runtime exposes no fcntl/kernel lock), so a crashed
-;; run leaves a stale <state>.lock that must be removed by hand. There is
-;; no GUI (the dabscm runtime has no windowing toolkit); use legacy-python
+;; JSON read/write/pretty-print comes from the (scm json simple) library and
+;; the per-config lock uses the (scm fs) file-lock primitive — a kernel
+;; advisory lock that auto-releases on process death (no stale locks). There
+;; is no GUI (the dabscm runtime has no windowing toolkit); use legacy-python
 ;; for the Tkinter GUI.
 
 (import (scheme base)
         (scheme write)
         (scheme file)
-        (scheme char)
         (scheme process-context)
         (srfi 1)
         (srfi 13)
@@ -33,232 +32,8 @@
         (scm fs)
         (scm system)
         (scm string)
-        (scm datetime))
-
-;; ======================================================================
-;; JSON — pure-Scheme parser + serializer (no dependency on (scm json)).
-;;
-;; Representation:
-;;   object     -> alist ((string . value) ...), source order preserved; '() = {}
-;;   array      -> vector #(v ...)
-;;   string     -> string
-;;   number     -> exact integer when integral, else inexact real
-;;   true/false -> #t / #f
-;;   null       -> the symbol 'null
-;; ======================================================================
-
-(define (json-parse str)
-  (let ((len (string-length str))
-        (pos 0))
-    (define (peek) (if (< pos len) (string-ref str pos) #f))
-    (define (next) (let ((c (string-ref str pos))) (set! pos (+ pos 1)) c))
-    (define (skip-ws)
-      (let loop ()
-        (let ((c (peek)))
-          (when (and c (char-whitespace? c)) (next) (loop)))))
-    (define (jerr msg) (error (string-append "json: " msg)))
-    (define (expect ch)
-      (skip-ws)
-      (if (eqv? (peek) ch) (next) (jerr (string-append "expected " (string ch)))))
-    (define (parse-value)
-      (skip-ws)
-      (let ((c (peek)))
-        (cond
-          ((not c) (jerr "unexpected end of input"))
-          ((char=? c #\{) (parse-object))
-          ((char=? c #\[) (parse-array))
-          ((char=? c #\") (parse-string))
-          ((or (char=? c #\-) (char-numeric? c)) (parse-number))
-          ((char=? c #\t) (parse-lit "true" #t))
-          ((char=? c #\f) (parse-lit "false" #f))
-          ((char=? c #\n) (parse-lit "null" 'null))
-          (else (jerr (string-append "unexpected char " (string c)))))))
-    (define (parse-lit word val)
-      (let loop ((i 0))
-        (if (= i (string-length word))
-            val
-            (if (eqv? (peek) (string-ref word i))
-                (begin (next) (loop (+ i 1)))
-                (jerr (string-append "expected " word))))))
-    (define (parse-object)
-      (next)
-      (skip-ws)
-      (if (eqv? (peek) #\})
-          (begin (next) '())
-          (let loop ((acc '()))
-            (skip-ws)
-            (let ((key (parse-string)))
-              (expect #\:)
-              (let ((val (parse-value)))
-                (skip-ws)
-                (let ((c (peek)))
-                  (cond
-                    ((eqv? c #\,) (next) (loop (cons (cons key val) acc)))
-                    ((eqv? c #\}) (next) (reverse (cons (cons key val) acc)))
-                    (else (jerr "expected , or }")))))))))
-    (define (parse-array)
-      (next)
-      (skip-ws)
-      (if (eqv? (peek) #\])
-          (begin (next) #())
-          (let loop ((acc '()))
-            (let ((val (parse-value)))
-              (skip-ws)
-              (let ((c (peek)))
-                (cond
-                  ((eqv? c #\,) (next) (loop (cons val acc)))
-                  ((eqv? c #\]) (next) (list->vector (reverse (cons val acc))))
-                  (else (jerr "expected , or ]"))))))))
-    (define (parse-string)
-      (skip-ws)
-      (unless (eqv? (peek) #\") (jerr "expected string"))
-      (next)
-      (let ((out (open-output-string)))
-        (let loop ()
-          (let ((c (next)))
-            (cond
-              ((char=? c #\") (get-output-string out))
-              ((char=? c #\\)
-               (let ((e (next)))
-                 (cond
-                   ((char=? e #\") (write-char #\" out) (loop))
-                   ((char=? e #\\) (write-char #\\ out) (loop))
-                   ((char=? e #\/) (write-char #\/ out) (loop))
-                   ((char=? e #\b) (write-char #\backspace out) (loop))
-                   ((char=? e #\f) (write-char #\x0c out) (loop))
-                   ((char=? e #\n) (write-char #\newline out) (loop))
-                   ((char=? e #\r) (write-char #\return out) (loop))
-                   ((char=? e #\t) (write-char #\tab out) (loop))
-                   ((char=? e #\u)
-                    (let ((cp (parse-hex4)))
-                      (if (and (>= cp #xD800) (<= cp #xDBFF))
-                          (begin
-                            (unless (eqv? (peek) #\\) (jerr "expected low surrogate"))
-                            (next)
-                            (unless (eqv? (peek) #\u) (jerr "expected \\u low surrogate"))
-                            (next)
-                            (let ((lo (parse-hex4)))
-                              (write-char (integer->char
-                                           (+ #x10000 (* (- cp #xD800) #x400) (- lo #xDC00)))
-                                          out)))
-                          (write-char (integer->char cp) out))
-                      (loop)))
-                   (else (jerr "bad escape")))))
-              (else (write-char c out) (loop)))))))
-    (define (parse-hex4)
-      (let loop ((i 0) (acc 0))
-        (if (= i 4) acc (loop (+ i 1) (+ (* acc 16) (hex-digit (next)))))))
-    (define (hex-digit c)
-      (cond
-        ((char<=? #\0 c #\9) (- (char->integer c) (char->integer #\0)))
-        ((char<=? #\a c #\f) (+ 10 (- (char->integer c) (char->integer #\a))))
-        ((char<=? #\A c #\F) (+ 10 (- (char->integer c) (char->integer #\A))))
-        (else (jerr "bad hex digit"))))
-    (define (parse-number)
-      (let ((start pos))
-        (when (eqv? (peek) #\-) (next))
-        (let loop () (when (and (peek) (char-numeric? (peek))) (next) (loop)))
-        (when (eqv? (peek) #\.)
-          (next)
-          (let loop () (when (and (peek) (char-numeric? (peek))) (next) (loop))))
-        (when (or (eqv? (peek) #\e) (eqv? (peek) #\E))
-          (next)
-          (when (or (eqv? (peek) #\+) (eqv? (peek) #\-)) (next))
-          (let loop () (when (and (peek) (char-numeric? (peek))) (next) (loop))))
-        ;; string->number yields an exact integer for integral text and an
-        ;; inexact real when a '.' or exponent is present.
-        (string->number (substring str start pos))))
-    (let ((result (parse-value))) (skip-ws) result)))
-
-(define (json-write val port)
-  (cond
-    ((eq? val 'null) (write-string "null" port))
-    ((eq? val #t) (write-string "true" port))
-    ((eq? val #f) (write-string "false" port))
-    ((string? val) (json-write-string val port))
-    ((number? val) (write-string (number->string val) port))
-    ((vector? val) (json-write-array val port))
-    ((or (null? val) (pair? val)) (json-write-object val port))
-    (else (error "json-write: cannot serialize" val))))
-
-(define (json-write-string s port)
-  (write-char #\" port)
-  (string-for-each
-    (lambda (c)
-      (cond
-        ((char=? c #\") (write-string "\\\"" port))
-        ((char=? c #\\) (write-string "\\\\" port))
-        ((char=? c #\newline) (write-string "\\n" port))
-        ((char=? c #\return) (write-string "\\r" port))
-        ((char=? c #\tab) (write-string "\\t" port))
-        ((char=? c #\backspace) (write-string "\\b" port))
-        ((char=? c #\x0c) (write-string "\\f" port))
-        ((< (char->integer c) #x20)
-         (write-string "\\u" port)
-         (write-string (string-pad (number->string (char->integer c) 16) 4 #\0) port))
-        (else (write-char c port))))
-    s)
-  (write-char #\" port))
-
-(define (json-write-array vec port)
-  (write-char #\[ port)
-  (let ((n (vector-length vec)))
-    (let loop ((i 0))
-      (when (< i n)
-        (when (> i 0) (write-char #\, port))
-        (json-write (vector-ref vec i) port)
-        (loop (+ i 1)))))
-  (write-char #\] port))
-
-(define (json-write-object alist port)
-  (write-char #\{ port)
-  (let loop ((items alist) (first #t))
-    (unless (null? items)
-      (unless first (write-char #\, port))
-      (json-write-string (caar items) port)
-      (write-char #\: port)
-      (json-write (cdar items) port)
-      (loop (cdr items) #f)))
-  (write-char #\} port))
-
-;; Pretty printer with 2-space indent, matching python json.dump(indent=2).
-(define (json-write-pretty val port)
-  (define (indent n) (make-string (* 2 n) #\space))
-  (define (go val depth)
-    (cond
-      ((vector? val)
-       (let ((n (vector-length val)))
-         (if (= n 0)
-             (write-string "[]" port)
-             (begin
-               (write-string "[\n" port)
-               (let loop ((i 0))
-                 (when (< i n)
-                   (write-string (indent (+ depth 1)) port)
-                   (go (vector-ref val i) (+ depth 1))
-                   (when (< i (- n 1)) (write-char #\, port))
-                   (write-char #\newline port)
-                   (loop (+ i 1))))
-               (write-string (indent depth) port)
-               (write-char #\] port)))))
-      ((or (pair? val) (null? val))
-       (if (null? val)
-           (write-string "{}" port)
-           (begin
-             (write-string "{\n" port)
-             (let loop ((items val))
-               (unless (null? items)
-                 (write-string (indent (+ depth 1)) port)
-                 (json-write-string (caar items) port)
-                 (write-string ": " port)
-                 (go (cdar items) (+ depth 1))
-                 (unless (null? (cdr items)) (write-char #\, port))
-                 (write-char #\newline port)
-                 (loop (cdr items))))
-             (write-string (indent depth) port)
-             (write-char #\} port))))
-      (else (json-write val port))))
-  (go val 0))
+        (scm datetime)
+        (scm json simple))
 
 ;; ======================================================================
 ;; Small utilities
@@ -307,18 +82,6 @@
                 (begin (write-char c o) (loop)))))))))
 
 (define (read-json-file path) (json-parse (read-file->string path)))
-
-;; recursive mkdir (mkdir -p). returns #t on success/exists.
-(define (make-dirs path)
-  (cond
-    ((or (not path) (string=? path "")) #f)
-    ((directory-exists? path) #t)
-    (else
-     (let ((parent (directory-name path)))
-       (unless (or (string=? parent path) (string=? parent "") (directory-exists? parent))
-         (make-dirs parent))
-       (guard (e (#t (directory-exists? path)))
-         (make-directory path) #t)))))
 
 ;; directory listing tolerant of a missing path (returns '()).
 (define (entries-safe path)
@@ -471,8 +234,7 @@
 (define *script-path* (car (command-line)))
 (define (base-dir) (directory-name (absolute-path *script-path*)))
 
-(define (aget obj key)
-  (and (pair? obj) (let ((p (assoc key obj))) (and p (cdr p)))))
+(define (aget obj key) (json-ref obj key))   ;; object lookup via (scm json simple)
 
 (define (config-source-directories c)
   (let ((d (aget (aget c "source") "directories")))
@@ -565,39 +327,23 @@
     directories))
 
 ;; ======================================================================
-;; locking — best-effort existence lock at <full_state_file>.lock.
-;; The runtime exposes no kernel/fcntl lock, so this cannot auto-release
-;; on process death: a crashed run leaves a stale lock to remove by hand.
+;; locking — kernel-managed advisory lock at <full_state_file>.lock via the
+;; (scm fs) file-lock primitive. Unlike an existence lock it auto-releases on
+;; process death (the OS frees it when the holder exits), so it never goes
+;; stale; the leftover empty .lock file is harmless and is not the signal.
 ;; ======================================================================
 
 (define (lock-path-for config) (string-append (config-full-state-file config) ".lock"))
 
-(define (acquire-lock! lock-path)
-  (if (path-exists? lock-path)
-      #f
-      (begin
-        (let ((parent (directory-name lock-path)))
-          (when (and parent (not (string=? parent "")) (not (directory-exists? parent)))
-            (make-dirs parent)))
-        (guard (e (#t #f))
-          (call-with-output-file lock-path
-            (lambda (p)
-              (display (current-pid) p) (newline p)
-              (display (now-str) p) (newline p)))
-          #t))))
-
-(define (release-lock! lock-path)
-  (guard (e (#t #f))
-    (when (path-exists? lock-path) (delete-file lock-path))))
-
-;; run thunk under the per-config write lock. Exits 1 if the lock is held.
-;; NOTE: thunk must not call (exit) or the lock would leak; locked commands
-;; return normally and let main decide the exit status.
+;; run thunk under the per-config write lock. Exits 1 if another process holds
+;; it. The OS releases the lock on process exit, so even an (exit) inside thunk
+;; cannot leave it stale; file-unlock is still called on the normal/error path.
 (define (with-lock config thunk)
-  (let ((lp (lock-path-for config)))
-    (if (acquire-lock! lp)
-        (let ((result (guard (e (#t (release-lock! lp) (raise e))) (thunk))))
-          (release-lock! lp)
+  (let* ((lp (lock-path-for config))
+         (handle (file-lock lp)))
+    (if handle
+        (let ((result (guard (e (#t (file-unlock handle) (raise e))) (thunk))))
+          (file-unlock handle)
           result)
         (begin
           (eprint "ERROR: another dabbak run holds the lock at " lp)
@@ -703,7 +449,7 @@
                             (plog err tag 'warn)
                             (plog (err->string e) tag 'warn))
                           #f))
-              (make-dirs (directory-name destpath))
+              (make-directory (directory-name destpath))
               (when (and overwrite (path-exists? destpath)) (delete-file destpath))
               (if (eq? (copy-file filepath destpath) #f)
                   (let ((err (string-append "ERR: failed to copy " filepath " => " destpath)))
@@ -718,7 +464,7 @@
     (when (and dry-run (not json-out))
       (prn "DRY RUN: no files will be copied, deleted, or state written"))
 
-    (unless (path-exists? dest-partial-base) (make-dirs dest-partial-base))
+    (unless (path-exists? dest-partial-base) (make-directory dest-partial-base))
 
     (set! full-log-port (open-output-file (get-full-log) 'append))
     (set! partial-log-port (open-output-file (get-partial-log dest-partial-base today) 'append))
@@ -736,7 +482,7 @@
 
     (unless (path-exists? dest-partial)
       (plog (string-append "create " dest-partial) 'partial)
-      (make-dirs dest-partial))
+      (make-directory dest-partial))
 
     ;; (sourcedir . prefixlen) for each expanded source dir
     (let ((source-prefixes
@@ -946,7 +692,7 @@
                                    (if dry-run
                                        (prn (string-append "DRY " destpath "  <-  " (car dirs) "/" relpath))
                                        (begin
-                                         (make-dirs (directory-name destpath))
+                                         (make-directory (directory-name destpath))
                                          (copy-file pathname destpath)
                                          (prn destpath)))
                                    (set! restored (+ restored 1)))
@@ -1011,7 +757,7 @@
                                     (set! size (+ size filesize))
                                     (let ((destpath (join-path (destbase) relpath)))
                                       (unless (path-exists? destpath)
-                                        (make-dirs (directory-name destpath))
+                                        (make-directory (directory-name destpath))
                                         (copy-file pathname destpath)
                                         (prn destpath))))
                                   (loop (cdr dirs)))))))))))

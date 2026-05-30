@@ -29,11 +29,11 @@ scmj test-dabbak.scm
 
 ## Architecture
 
-`dabbak.scm` is self-contained, organized top-to-bottom as: a pure-Scheme JSON library, small utilities, fnmatch/excludes, walk, config/state, path-prefix logic, locking, logging, the backup engine, restore/package/list/prune/refresh-state/init/config, then the CLI.
+`dabbak.scm` is self-contained, organized top-to-bottom as: small utilities, fnmatch/excludes, walk, config/state, path-prefix logic, locking, logging, the backup engine, restore/package/list/prune/refresh-state/init/config, then the CLI.
 
-### JSON (the one piece dabscm couldn't provide)
+### JSON
 
-dabscm's built-in `(scm json)` reader returns objects as opaque `JsonObject`s queried by *known* attribute name — it cannot enumerate an object's keys, which is fatal for a state file `{path: [size, mtime]}` whose path keys are dynamic. So `dabbak.scm` carries its own **pure-Scheme JSON parser + serializer** (no dependency on `(scm json)`). This is portable Scheme that could later graduate into the dabscm runtime.
+dabscm's built-in `(scm json)` reader returns objects as opaque `JsonObject`s queried by *known* attribute name — it cannot enumerate an object's keys, which is fatal for a state file `{path: [size, mtime]}` whose path keys are dynamic. dabbak therefore uses **`(scm json simple)`** — a high-level codec added to dabscm for exactly this: `json-parse` (text → sexp), `json-write`/`json-write-pretty` (sexp → text), and `json-ref` for object lookup. Objects map to alists with string keys, arrays to vectors, null to the symbol `'null`; `json-write-pretty` is byte-compatible with Python's `json.dump(indent=2)`. The state alist is loaded into a SRFI-69 hashtable for O(1) lookups during the walk and written back key-sorted. (Originally this library was carried inline in `dabbak.scm`; it was extracted into the runtime.)
 
 Representation (the answer to "hashtables or alists for objects?"):
 - JSON **object → alist** `(("k" . v) ...)`, source order preserved (`'()` = `{}`)
@@ -60,13 +60,13 @@ Files are stored under destinations using `filepath[prefixlen:]` where `prefix =
 
 `compile-excludes` classifies each entry: no slash → match basename anywhere; slash + glob → match the full path; slash, no glob → exact absolute-path match. Globbing is done by `fnmatch->regex` over `string-matches` (not `(scm glob)`), so `*` matches path separators exactly as Python's `fnmatch` does; matching is case-insensitive on Windows.
 
-### Locking — the one behavioral compromise
+### Locking
 
-The runtime exposes no `fcntl`/kernel lock and its `process-alive?` is non-functional, so the per-config lock (`<full_state_file>.lock`, used by `backup`/`package`/`refresh-state`/`prune --force`) is a **best-effort existence lock**: it serializes writers like the Python version but **cannot auto-release on process death** — a crashed run leaves a stale lock that must be removed by hand. Locked operations must never call `(exit)` (it would skip lock release); error checks that exit, e.g. package's "dest exists", run *before* `with-lock`.
+The per-config lock (`<full_state_file>.lock`, used by `backup`/`package`/`refresh-state`/`prune --force`) uses the **`(scm fs)` `file-lock`/`file-unlock`** primitives — a kernel-managed advisory lock (FileShare.None on .NET, `FileChannel.tryLock` on the JVM). `with-lock` acquires it (or exits 1 if another process holds it), runs the thunk, and releases it. Because the OS frees the lock when the holding process exits, a crashed run leaves **no stale lock** — the leftover empty `.lock` file is not the signal and is harmless. (This replaced an earlier best-effort existence lock that could go stale; `make-directory` is already recursive in dabscm, so dabbak calls it directly rather than a hand-rolled `mkdir -p`.)
 
 ### Filesystem notes
 
-`(scm fs)` handles Windows long paths internally (no `_long`/`\\?\` equivalent needed). `delete-directory` is **recursive** (serves as `rmtree` for prune; ancestor-pruning in `remove-file-pruning` guards on emptiness first). `make-dirs` is a `mkdir -p` (the primitive `make-directory` is one level). `norm-path` wraps `normalized-path` to strip a trailing separator, matching Python `os.path.normpath`. Symlinks are skipped during the walk (type `'symlink`), as in the Python original.
+`(scm fs)` handles Windows long paths internally (no `_long`/`\\?\` equivalent needed). `delete-directory` is **recursive** (serves as `rmtree` for prune; ancestor-pruning in `remove-file-pruning` guards on emptiness first). `make-directory` is already `mkdir -p` (recursive), so dabbak calls it directly. `norm-path` wraps `normalized-path` to strip a trailing separator, matching Python `os.path.normpath`. Symlinks are skipped during the walk (type `'symlink`), as in the Python original.
 
 ## Config shape
 

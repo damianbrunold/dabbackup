@@ -105,6 +105,13 @@
 (define (db-exit base . args) (car (apply db base args)))
 (define (db-out base . args) (cadr (apply db base args)))
 
+;; The lock is a kernel advisory lock (file-lock): an empty .lock file on disk
+;; is NOT the signal — whether it can be acquired is. This holds/probes it from
+;; the test process, which is a separate OS process from the dabbak subprocess.
+(define (lock-acquirable? path)
+  (let ((h (file-lock path)))
+    (and h (begin (file-unlock h) #t))))
+
 (test-begin "dabbak")
 
 ;; ===================== backup: core =====================
@@ -313,14 +320,14 @@
       (test-equal #t (file-exists? (join-path dest (string-append "backup-" (today) "-part-1/src/a.txt"))))
       (test-equal #t (file-exists? (join-path base "packaging-state.json")))))))
 
-(test-group "package: existing dest without --force exits 1 and leaks no lock"
+(test-group "package: existing dest without --force exits 1, lock not left held"
   (with-backup '() (lambda (base script src full partial)
     (make-file (join-path src "a.txt") "hello")
     (db base "backup" "--json")
     (let ((dest (join-path base "pkg")))
       (make-directory dest)
       (test-equal 1 (db-exit base "package" dest "100"))
-      (test-equal #f (file-exists? (join-path base "state.json.lock")))))))
+      (test-equal #t (lock-acquirable? (join-path base "state.json.lock")))))))
 
 ;; ===================== config / init =====================
 
@@ -344,20 +351,24 @@
 
 ;; ===================== locking / cli errors =====================
 
-(test-group "lock: held lock makes backup exit 1"
+(test-group "lock: a held lock makes backup exit 1"
   (with-backup '() (lambda (base script src full partial)
     (make-file (join-path src "a.txt") "hello")
-    (write-file (join-path base "state.json.lock") "99999\n2020\n")
-    (let ((r (db base "backup")))
-      (test-equal 1 (car r))
-      (test-assert (string-contains (caddr r) "lock")))
-    (delete-file (join-path base "state.json.lock")))))
+    ;; hold the OS lock from this process; the backup subprocess must be blocked
+    (let ((h (file-lock (join-path base "state.json.lock"))))
+      (test-assert h)
+      (let ((r (db base "backup")))
+        (test-equal 1 (car r))
+        (test-assert (string-contains (caddr r) "lock")))
+      (file-unlock h)))))
 
-(test-group "lock: backup releases lock on success"
+(test-group "lock: backup releases lock on success (re-runnable)"
   (with-backup '() (lambda (base script src full partial)
     (make-file (join-path src "a.txt") "hello")
     (db base "backup" "--json")
-    (test-equal #f (file-exists? (join-path base "state.json.lock"))))))
+    (test-equal #t (lock-acquirable? (join-path base "state.json.lock")))
+    ;; and a second backup runs fine
+    (test-equal 0 (db-exit base "backup" "--json")))))
 
 (test-group "cli: no command exits 2"
   (with-backup '() (lambda (base script src full partial)

@@ -4,69 +4,69 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`dabbak` is a single-file Python backup tool (`dabbak.py`, stdlib only, no dependencies). It maintains one always-current "full" mirror plus dated "partial" snapshots of incremental changes, allowing point-in-time restore.
+`dabbak` is a single-file Scheme utility (`dabbak.scm`) for incremental backups: it maintains one always-current "full" mirror plus dated "partial" snapshots of incremental changes, allowing point-in-time restore. It runs under the dabscm interpreter (`scm`, or `scmj` for the Java build) and uses only that runtime's standard libraries. Tests live in `test-dabbak.scm`.
 
-## Commands
+The tool was originally a Python script with a Tkinter GUI. The Scheme port replaced it on `main`; the last Python state (including the GUI) is preserved on the `legacy-python` branch. The Scheme port is **drop-in compatible** with the Python version: same config file, same JSON state format, same snapshot layout, same CLI surface — you can point it at a backup destination the Python tool produced and vice versa.
 
-Run from the repository root (where `dabbak.py` and the config live):
+## Running
 
-```bash
-python dabbak.py init                                     # write a config template
-python dabbak.py backup [--dry-run] [--quiet] [--json]
-python dabbak.py restore <dest-dir> [-t <yyyy-mm-dd>] [pattern ...] [--dry-run] [--force]
-python dabbak.py list [--json]
-python dabbak.py prune --keep-last N | --keep-days N [--force] [--json]
-python dabbak.py package <dest-dir> <max-size> [<yyyy-mm-dd>] [--full] [--force]
-python dabbak.py refresh-state
-python dabbak.py config        # dump effective config
-python -m unittest discover -s tests   # run test suite (stdlib only)
+```
+scm dabbak.scm <command> [options]
 ```
 
-- `max-size` accepts suffixes `k`, `m`, `g` (e.g. `4g`).
-- Config is selected by the `DABBAK_CONFIG` env var (default: `backup-config.json`), resolved relative to the directory of `dabbak.py`. Multiple config files coexist in the repo (`backup-config-damian.json`, `backup-config-rahel.json`, template).
-- CLI uses `argparse`; `--help` works per subcommand.
+Commands: `init`, `backup`, `restore`, `list`, `prune`, `package`, `refresh-state`, `config`. Config is selected by the `DABBAK_CONFIG` env var (default `backup-config.json`), resolved relative to the directory of `dabbak.scm` (`base-dir`). The script runs `main` on load via `(main (cdr (command-line)))`.
+
+There is **no `gui` command** — the dabscm runtime ships no windowing toolkit. Use the `legacy-python` branch for the Tkinter GUI.
+
+## Tests
+
+The suite is **black-box** (like `test-dabsync.scm` in the sibling dabsync project): it copies `dabbak.scm` into a fresh temp directory (so the script's own folder becomes the config/`base-dir`, as in a real install), writes a config there, invokes the script as a subprocess (via `run-program/capture` from `(scm system)`) and asserts on the resulting filesystem, exit codes and captured output. It does not import dabbak's internals. The interpreter is chosen to match the one running the tests (`sys-scm-technology`), overridable with `DABBAK_SCM` / `DABBAK_SCRIPT`.
+
+```
+scm  test-dabbak.scm
+scmj test-dabbak.scm
+```
 
 ## Architecture
 
-**State-driven incremental backup.** A single JSON file (`full_state_file` in config) maps each source `filepath -> [size, mtime]`. A file is considered changed when size differs or when mtime differs by ≥ `MTIME_TOLERANCE_SECONDS` (2s, to absorb FAT/exFAT/SMB rounding). `make_backup` walks all configured sources, diffs against state, writes changed/new files to **both** `dest_full` (mirror) and `dest_partial/<today>/` (dated snapshot), then deletes files missing from the source from both destinations. State is rewritten at the end and copied into the partial snapshot as `__state.json`.
+`dabbak.scm` is self-contained, organized top-to-bottom as: a pure-Scheme JSON library, small utilities, fnmatch/excludes, walk, config/state, path-prefix logic, locking, logging, the backup engine, restore/package/list/prune/refresh-state/init/config, then the CLI.
 
-**Path layout.** Files are stored under destinations using `filepath[prefixlen:]`, where `prefix = os.path.dirname(sourcedir)`. So the last path component of each source directory is preserved as the top-level folder in the backup. The `prefixlen` calculation is centralized in `compute_prefixlen()` and used by `make_backup`, `restore`, and `refresh_state`. `find_source_prefix(config, fullpath)` maps a state-key path back to its prefix (used by restore/package); it handles wildcard sources and Windows-formatted state paths read on POSIX.
+### JSON (the one piece dabscm couldn't provide)
 
-**Failure semantics.** `make_backup` tracks a `completed` flag. On success: deletion pass runs, state is rewritten, `__state.json` is copied into the dated snapshot. On any exception (including `KeyboardInterrupt`): the deletion pass is **skipped**, state is **merged** (old entries for unvisited paths preserved, new/updated entries from `new_state` win), and the snapshot folder gets an `__incomplete` marker so `restore`/`package` ignore it. State is always written atomically via tmp + fsync + `os.replace`.
+dabscm's built-in `(scm json)` reader returns objects as opaque `JsonObject`s queried by *known* attribute name — it cannot enumerate an object's keys, which is fatal for a state file `{path: [size, mtime]}` whose path keys are dynamic. So `dabbak.scm` carries its own **pure-Scheme JSON parser + serializer** (no dependency on `(scm json)`). This is portable Scheme that could later graduate into the dabscm runtime.
 
-**Windows long paths.** All filesystem syscalls go through `fs_*` wrappers that prepend `\\?\` (or `\\?\UNC\` for UNC) on Windows via `_long()`. Bare paths remain as dictionary keys in state — only the syscall site sees the prefixed form. When adding any new fs operation, use the `fs_*` wrapper, not raw `os.*` / `shutil.*`.
+Representation (the answer to "hashtables or alists for objects?"):
+- JSON **object → alist** `(("k" . v) ...)`, source order preserved (`'()` = `{}`)
+- JSON **array → vector** `#(v ...)` — keeps objects and arrays unambiguous (a list is always an object, a vector always an array)
+- string → string; integral number → exact integer; fractional/exponent → inexact real; `true`/`false` → `#t`/`#f`; `null` → the symbol `'null`
 
-**Stats / output.** `make_backup` accumulates a `stats` dict (new/changed/deleted/unchanged/failed counts + bytes_copied + elapsed_seconds + completed + dry_run) and returns it. Output is gated by three flags:
-- default: per-file `++ ** --` lines on stdout + summary
-- `--quiet`: warnings + summary only
-- `--json`: nothing on stdout except a JSON dump of `stats` at the end
+`json-write-pretty` produces 2-space-indent output byte-compatible with Python's `json.dump(indent=2)`. The **backup engine** loads the state alist into a **SRFI-69 hashtable** for O(1) lookups during the walk (an alist would be O(n²) over large trees) and writes it back as a key-sorted alist. So: alists at the data-interchange boundary, a hashtable as the working index.
 
-Live progress goes to stderr (so it never mixes with `--json` on stdout). `Progress` uses `len(prev_state)` and the sum of recorded sizes as denominator estimates — no pre-scan. First-ever run shows just a running tally.
+### State and change detection
 
-**Concurrency.** A per-config kernel-managed exclusive lock (`<full_state_file>.lock`, `fcntl.flock` on POSIX / `msvcrt.locking` on Windows) serializes write commands: `backup`, `refresh-state`, `prune --force`, `package`. A second invocation exits 1 with a clear message instead of corrupting state. Read-only commands (`restore`, `list`, `config`, `init`, dry-run prune) skip the lock so they can run alongside a backup. The lock auto-releases on process death (no stale-lock cleanup needed).
+State (`full_state_file`) is a JSON object `{absolute_path: [size, seconds]}`. **mtime is stored in seconds** (`file-modification-timestamp` returns milliseconds in dabscm, so the engine divides by 1000) to match the Python format byte-for-byte — this is what makes the state files interoperable. A file is "changed" if size differs or mtime differs by ≥ 2 seconds (`mtime-changed?`, absorbing FAT/exFAT/SMB rounding). `copy-file` preserves mtime so runs are idempotent.
 
-**Retention.** `cmd_prune` deletes whole snapshot folders (and their `backup-partial-<date>.log`) based on `--keep-last N` and/or `--keep-days N` (union of policies). Today's snapshot is always kept. Dry-run unless `--force`.
+### Backup engine (`make-backup`)
 
-**Reliability invariant for state.** A file's entry in `new_state` is updated ONLY when both partial and full copies succeeded. On copy failure for a *changed* file, the OLD `[size, mtime]` is carried over so the next run still sees a diff and retries. New files that fail to copy stay out of state entirely so the next run treats them as new again. This is what makes failed files self-healing across runs.
+Walks the union of configured sources, diffs each file against state, copies new/changed files into **both** `dest_full` (mirror) and `dest_partial/<today>/` (dated snapshot), then — only if the walk completed — deletes from both destinations any file in state but missing from the source. The walk runs inside a `guard`; any error (the runtime's nearest analogue to Ctrl-C) leaves `completed = #f`, which **skips the deletion pass and merges state** (old entries for unvisited paths preserved) and drops an `__incomplete` marker into the snapshot so `restore`/`package` ignore it. On success, the state is copied into the snapshot as `__state.json`. State is written atomically via tmp + `move-file` (rename). A changed file whose copy fails carries its OLD `[size, mtime]` forward so the next run retries; a failed new file stays out of state entirely.
 
-**Source expansion.** A source path ending in `*` is expanded one level: e.g. `/home/users/*` becomes each immediate child directory. Symlinks and junctions are skipped.
+Output via `plog`: `++` new, `**` changed, `--` deleted, routed to `backup-full.log` (rotated at 10 MB) and `backup-partial-<date>.log` always; stdout is gated by `--quiet` (suppresses info/file lines) and `--json` (suppresses everything but the final stats JSON). A lightweight `Progress` writes a throttled tally to stderr (so it never mixes with `--json` on stdout).
 
-**Excludes (gitignore-flavored).** `config.source.excludes` accepts three forms, classified by `compile_excludes()`:
-- **No slash** (`__pycache__`, `*.pyc`, `node_modules`) — match against the basename of any walked path. Globs (`*`, `?`, `[…]`) are supported. This is the form you almost always want.
-- **Has slash + glob** (`**/build/*`) — match against the full path via `fnmatch`. fnmatch's `*` matches separators, so `**/foo` works.
-- **Has slash, no glob** (`/home/user/.cache`) — exact absolute-path match (legacy form, still supported).
+### Path layout
 
-Matching is case-insensitive on Windows (via `os.path.normcase`) to mirror the filesystem.
+Files are stored under destinations using `filepath[prefixlen:]` where `prefix = dirname(sourcedir)`, so the last component of each source directory becomes the top-level folder in the backup. `compute-prefixlen` centralizes this; `find-source-prefix` maps a state-key path back to its prefix for restore/package (handling `*` wildcard sources and Windows-formatted state paths read on POSIX via the `is-windows` flag). `expand-source-dirs` expands a trailing-`*` source one level into its child directories (skipping symlinks).
 
-**Restore.** Given a target date, lists `dest_partial` directories in reverse order, filters to those `<= timestamp`, loads `__state.json` from the most recent one as the file manifest, then for each file walks the history newest-first and copies the first matching version found. `source_path` argument filters which files to restore by prefix.
+### Excludes (gitignore-flavored)
 
-**Package.** Builds chunked archives (size-limited folder sets named `backup-<ts>-part-N`) for offline storage. Without `--full`, only snapshots **after** the timestamp recorded in `packaging_state_file` are included (incremental packaging); `--full` ignores the cutoff and updates that state file afterward.
+`compile-excludes` classifies each entry: no slash → match basename anywhere; slash + glob → match the full path; slash, no glob → exact absolute-path match. Globbing is done by `fnmatch->regex` over `string-matches` (not `(scm glob)`), so `*` matches path separators exactly as Python's `fnmatch` does; matching is case-insensitive on Windows.
 
-**refresh-state.** Rebuilds `full_state_file` by walking `dest_full` instead of the live sources — used to recover state if the state file is lost or corrupted, mapping mirror paths back to their original source paths.
+### Locking — the one behavioral compromise
 
-**Logging.** Two parallel logs: `backup-full.log` (appended forever, in repo root) and `backup-partial-<date>.log` (in `dest_partial_base`). The `plog()` helper routes each line to "full", "partial", or both. Prefixes in logs: `++` new, `**` changed, `--` deleted.
+The runtime exposes no `fcntl`/kernel lock and its `process-alive?` is non-functional, so the per-config lock (`<full_state_file>.lock`, used by `backup`/`package`/`refresh-state`/`prune --force`) is a **best-effort existence lock**: it serializes writers like the Python version but **cannot auto-release on process death** — a crashed run leaves a stale lock that must be removed by hand. Locked operations must never call `(exit)` (it would skip lock release); error checks that exit, e.g. package's "dest exists", run *before* `with-lock`.
 
-**Windows interop.** When `source.is-windows` is true and running on POSIX (running the tool against a mounted Windows backup), source dirs may use `\` separators; `find_source_prefix` handles the mixed case. Be careful preserving this when touching path handling.
+### Filesystem notes
+
+`(scm fs)` handles Windows long paths internally (no `_long`/`\\?\` equivalent needed). `delete-directory` is **recursive** (serves as `rmtree` for prune; ancestor-pruning in `remove-file-pruning` guards on emptiness first). `make-dirs` is a `mkdir -p` (the primitive `make-directory` is one level). `norm-path` wraps `normalized-path` to strip a trailing separator, matching Python `os.path.normpath`. Symlinks are skipped during the walk (type `'symlink`), as in the Python original.
 
 ## Config shape
 

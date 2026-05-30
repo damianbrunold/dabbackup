@@ -1,8 +1,8 @@
 # dabbak
 
-A small, dependency-free Python backup tool that keeps an always-current mirror of your files plus dated incremental snapshots, so you can restore both "the latest version" and "this file as it was last Tuesday."
+A small, dependency-free Scheme backup tool that keeps an always-current mirror of your files plus dated incremental snapshots, so you can restore both "the latest version" and "this file as it was last Tuesday."
 
-Single file, stdlib only. Runs on Linux, macOS, and Windows.
+Single self-contained file, runs under the [dabscm](https://github.com/dab/dabscm) interpreter (`scm`, or `scmj` for the Java build) using only its standard libraries. Runs on Linux, macOS, and Windows. Originally a Python tool; the Scheme port is drop-in compatible with it (same config, same JSON state format, same snapshot layout). The Python version — including its Tkinter GUI — lives on the `legacy-python` branch.
 
 ## What it does
 
@@ -16,37 +16,31 @@ A JSON state file remembers each file's size + mtime between runs, so dabbak kno
 ## Quick start
 
 ```bash
-# 1. Drop dabbak.py somewhere convenient
+# 1. Drop dabbak.scm somewhere convenient
 # 2. Create a config file next to it
-python dabbak.py init
+scm dabbak.scm init
 
 # 3. Edit backup-config.json to point at your real sources/destinations
 # 4. Run a backup
-python dabbak.py backup
-```
-
-Or, for a friendlier first-time experience, open the GUI and configure / back up / restore from there:
-
-```bash
-python dabbak.py gui
+scm dabbak.scm backup
 ```
 
 ## Requirements
 
-- Python 3.9+ (3.12+ recommended for `os.path.isjunction` support on Windows; older versions silently skip the check)
-- No third-party packages
+- The dabscm interpreter on your `PATH` as `scm` (C# build) or `scmj` (Java build).
+- No third-party packages; only the dabscm standard libraries are used.
 
 ## Setup
 
-1. **Place `dabbak.py`** somewhere convenient (e.g. `~/bin/`, `/opt/dabbak/`, or your home directory).
+1. **Place `dabbak.scm`** somewhere convenient (e.g. `~/bin/`, `/opt/dabbak/`, or your home directory).
 
 2. **Generate a config template:**
 
    ```bash
-   python dabbak.py init
+   scm dabbak.scm init
    ```
 
-   This creates `backup-config.json` next to `dabbak.py`. You can name it anything with `--name foo.json`.
+   This creates `backup-config.json` next to `dabbak.scm`. You can name it anything with `--name foo.json`.
 
 3. **Edit the config** to point at your real sources and destinations:
 
@@ -68,13 +62,13 @@ python dabbak.py gui
 4. **Verify the config is picked up:**
 
    ```bash
-   python dabbak.py config
+   scm dabbak.scm config
    ```
 
 5. **First backup** (this initial run copies *everything* — subsequent runs only handle changes):
 
    ```bash
-   python dabbak.py backup
+   scm dabbak.scm backup
    ```
 
 ### Using multiple configs
@@ -82,7 +76,7 @@ python dabbak.py gui
 dabbak reads `backup-config.json` by default. To use a different file, set the `DABBAK_CONFIG` env var:
 
 ```bash
-DABBAK_CONFIG=backup-config-laptop.json python dabbak.py backup
+DABBAK_CONFIG=backup-config-laptop.json scm dabbak.scm backup
 ```
 
 ## Configuration reference
@@ -95,7 +89,7 @@ DABBAK_CONFIG=backup-config-laptop.json python dabbak.py backup
 | `destination.directory_full` | str | Where the always-current mirror lives. |
 | `destination.directory_partial` | str | Where dated snapshots live (one folder per day they ran). |
 | `full_state_file` | str | Path to the JSON state file. dabbak writes to it atomically. |
-| `packaging_state_file` | str | Relative path (resolved next to `dabbak.py`) where `package --full` records its last full-package timestamp. |
+| `packaging_state_file` | str | Relative path (resolved next to `dabbak.scm`) where `package --full` records its last full-package timestamp. |
 
 ### Exclude syntax
 
@@ -111,11 +105,11 @@ Matching is case-insensitive on Windows to match the filesystem.
 
 ## Commands
 
-All commands are subcommands of `dabbak.py`. Every subcommand supports `--help`.
+All commands are subcommands of `dabbak.scm`. Every subcommand supports `--help`.
 
 ### `init`
 
-Create a config template next to `dabbak.py`.
+Create a config template next to `dabbak.scm`.
 
 ```
 dabbak init [--name FILE] [--force]
@@ -250,23 +244,9 @@ dabbak config
 
 ---
 
-### `gui`
+### GUI
 
-Launch a graphical interface (Tkinter, stdlib — no extra packages).
-
-```
-dabbak gui
-```
-
-The window has three tabs:
-
-- **Backup** — shows a summary of the active config (sources, mirror path, snapshot path) and a *Run Backup* / *Dry Run* button. Output streams live into a scrollable log pane. A *Close window after successful backup* checkbox lets you start a run and walk away — the window closes only on a clean completion (no copy failures, no logged errors); any problem keeps it open so you can read the log. Dry-runs never auto-close. The CLI lockfile still applies, so a second launch (or a concurrent cron run) sees a clear error rather than racing.
-- **Restore** — pick a snapshot date from the dropdown, type a name or pattern in the *Search* box (case-insensitive substring; or a glob if it contains `*`, `?`, `[`), click *Search*. Select one or more results, click *Restore Selected…*, choose a destination directory. Restored files keep their original mtimes.
-- **Settings** — add/remove source directories and exclude patterns, set the mirror / snapshots / state-file paths, *Save*. Saves atomically to the same config file the CLI uses (`backup-config.json` by default, or whatever `DABBAK_CONFIG` points at).
-
-The GUI shares everything with the CLI: same config file, same state, same lockfile. You can run scheduled `backup` from cron and use the GUI for ad-hoc restores on the same machine without anything special.
-
-On Linux, you may need to install Tk: `sudo apt install python3-tk` (Debian/Ubuntu) or the equivalent. On macOS and Windows the default Python install already ships with it.
+The Scheme port is **CLI-only** — the dabscm runtime ships no windowing toolkit. The Python version's Tkinter GUI (Backup / Restore / Settings tabs) is preserved on the `legacy-python` branch and shares the same config, state and lockfile as this CLI, so you can run it on the same backup destination if you need a graphical front-end.
 
 ## Common use cases
 
@@ -274,10 +254,10 @@ On Linux, you may need to install Tk: `sudo apt install python3-tk` (Debian/Ubun
 
 ```cron
 # Backup every night at 02:00, log everything to a sibling file
-0 2 * * *  cd /opt/dabbak && python dabbak.py backup --quiet >> /var/log/dabbak.log 2>&1
+0 2 * * *  cd /opt/dabbak && scm dabbak.scm backup --quiet >> /var/log/dabbak.log 2>&1
 
 # Once a week, prune snapshots older than 90 days
-0 3 * * 0  cd /opt/dabbak && python dabbak.py prune --keep-days 90 --force --json >> /var/log/dabbak.log
+0 3 * * 0  cd /opt/dabbak && scm dabbak.scm prune --keep-days 90 --force --json >> /var/log/dabbak.log
 ```
 
 The per-config lockfile guarantees a manual `dabbak backup` and the cron job can't run at the same time.
@@ -285,7 +265,7 @@ The per-config lockfile guarantees a manual `dabbak backup` and the cron job can
 ### Restore a single file as of last Tuesday
 
 ```bash
-python dabbak.py restore /tmp/recovered -t 2026-05-12 /home/me/Documents/report.docx
+scm dabbak.scm restore /tmp/recovered -t 2026-05-12 /home/me/Documents/report.docx
 ```
 
 `/tmp/recovered/home/me/Documents/report.docx` will appear with the version that existed on or before May 12.
@@ -293,7 +273,7 @@ python dabbak.py restore /tmp/recovered -t 2026-05-12 /home/me/Documents/report.
 ### Restore everything in a folder
 
 ```bash
-python dabbak.py restore /tmp/recovered "/home/me/Projects/myapp/*"
+scm dabbak.scm restore /tmp/recovered "/home/me/Projects/myapp/*"
 ```
 
 (Quote the glob so the shell doesn't expand it locally.)
@@ -301,13 +281,13 @@ python dabbak.py restore /tmp/recovered "/home/me/Projects/myapp/*"
 ### Restore a whole subtree as it was a week ago
 
 ```bash
-python dabbak.py restore /tmp/recovered -t 2026-05-07 /home/me/Documents
+scm dabbak.scm restore /tmp/recovered -t 2026-05-07 /home/me/Documents
 ```
 
 ### Preview a restore without copying
 
 ```bash
-python dabbak.py restore /tmp/recovered -t 2026-05-12 "*.docx" --dry-run
+scm dabbak.scm restore /tmp/recovered -t 2026-05-12 "*.docx" --dry-run
 ```
 
 ### See what changed in last night's run
@@ -316,12 +296,12 @@ python dabbak.py restore /tmp/recovered -t 2026-05-12 "*.docx" --dry-run
 grep -E '^(\+\+|\*\*|--)' /mnt/backup/partial/backup-partial-2026-05-13.log | head
 ```
 
-Each snapshot folder has its own log; the always-appended `backup-full.log` next to `dabbak.py` is the long-term audit trail (auto-rotated at 10 MB).
+Each snapshot folder has its own log; the always-appended `backup-full.log` next to `dabbak.scm` is the long-term audit trail (auto-rotated at 10 MB).
 
 ### Inspect snapshot history
 
 ```bash
-python dabbak.py list
+scm dabbak.scm list
 ```
 
 ```
@@ -337,8 +317,8 @@ date         files       size  status
 ### Recover after a lost state file
 
 ```bash
-python dabbak.py refresh-state
-python dabbak.py backup
+scm dabbak.scm refresh-state
+scm dabbak.scm backup
 ```
 
 The first command rebuilds state from the mirror; the second resumes normal incremental operation.
@@ -346,7 +326,7 @@ The first command rebuilds state from the mirror; the second resumes normal incr
 ### Build an offline archive for a 4 GB DVD set
 
 ```bash
-python dabbak.py package /tmp/dvd-set 4g --full
+scm dabbak.scm package /tmp/dvd-set 4g --full
 ```
 
 Produces `/tmp/dvd-set/backup-<date>-part-1/`, `part-2/`, etc., each ≤ 4 GB. The `--full` flag also records this run as the new packaging cutoff, so the next `package` run (without `--full`) will start from here.
@@ -355,10 +335,10 @@ Produces `/tmp/dvd-set/backup-<date>-part-1/`, `part-2/`, etc., each ≤ 4 GB. T
 
 ```bash
 # Backup the laptop config
-DABBAK_CONFIG=backup-laptop.json python dabbak.py backup
+DABBAK_CONFIG=backup-laptop.json scm dabbak.scm backup
 
 # Backup the photos config (uses its own state file, its own lockfile)
-DABBAK_CONFIG=backup-photos.json python dabbak.py backup
+DABBAK_CONFIG=backup-photos.json scm dabbak.scm backup
 ```
 
 Each config has its own state file → its own lock → the two can run concurrently.
@@ -371,8 +351,8 @@ Each config has its own state file → its own lock → the two can run concurre
 - **Snapshot layout**: same shape as the mirror, but only files that changed on that day. Plus a `__state.json` file capturing the manifest for that point in time.
 - **Restore** loads `__state.json` from the requested date's snapshot as the manifest, then for each listed file searches the snapshot history newest-first for the most recent copy.
 - **Failure semantics**: any exception (or Ctrl-C) during the walk skips the deletion pass and merges state instead of overwriting it, so the next run resumes cleanly. The interrupted snapshot folder is marked `__incomplete` and ignored by restore/package.
-- **Concurrency**: every write command acquires a per-config kernel lock (`fcntl.flock` / `msvcrt.locking`) that auto-releases on process death.
-- **Windows long paths**: every filesystem syscall is routed through wrappers that prepend `\\?\` to bypass MAX_PATH=260, so >260-char paths work natively.
+- **Concurrency**: every write command (`backup`, `package`, `refresh-state`, `prune --force`) acquires a per-config lock at `<full_state_file>.lock`. The dabscm runtime offers no kernel lock, so this is a best-effort *existence* lock: a second run sees a clear error instead of racing, but unlike the Python version it does **not** auto-release on process death — a crashed run leaves a stale `.lock` you must remove by hand.
+- **Windows long paths**: handled inside the `(scm fs)` primitives, so >260-char paths work natively with no `\\?\` plumbing in the tool itself.
 
 ## Files dabbak writes
 
@@ -382,12 +362,12 @@ Each config has its own state file → its own lock → the two can run concurre
 - `destination.directory_full/...` — the always-current mirror.
 - `destination.directory_partial/YYYY-MM-DD/` — dated snapshots, each containing changed-files-only + `__state.json` (+ `__incomplete` if the run failed).
 - `destination.directory_partial/backup-partial-YYYY-MM-DD.log` — per-day log.
-- `backup-full.log` next to `dabbak.py` — append-only audit log, auto-rotates to `.log.1` at 10 MB.
+- `backup-full.log` next to `dabbak.scm` — append-only audit log, auto-rotates to `.log.1` at 10 MB.
 - `<base_dir>/<packaging_state_file>` — last `package --full` timestamp.
 
 ## Copying the backup off-host (preserving mtimes)
 
-`dabbak.py backup` and `dabbak.py restore` both use `shutil.copy2`, which preserves file modification times. So the mtimes on files in `directory_full` and inside each dated snapshot match the source mtimes as of the last time those files were copied.
+`dabbak backup` and `dabbak restore` both copy with `copy-file`, which preserves file modification times. So the mtimes on files in `directory_full` and inside each dated snapshot match the source mtimes as of the last time those files were copied.
 
 If you ever copy `directory_full` manually — e.g. to bring a backup over to a new machine, or to clone it to a second drive — **make sure your copy tool preserves mtimes**. If it doesn't, every file gets the copy time as its new mtime. That's not data loss, but if you later turn the copied tree back into a dabbak source, the very next backup will see every file as "changed" (mtime differs from state) and re-copy every byte unnecessarily.
 
@@ -414,18 +394,21 @@ The cost is one full re-copy step lost — the new mirror won't carry the origin
 
 - **Symlinks and junctions are skipped** silently. If you have meaningful symlinks in your backup tree, they won't be preserved.
 - **Empty directories aren't preserved**. State tracks files only.
-- **File metadata**: `shutil.copy2` is used, which preserves mtime and basic permissions. ACLs, xattrs, ownership (uid/gid), Windows ADS streams, and resource forks are *not* preserved.
+- **File metadata**: `copy-file` preserves mtime and file contents. ACLs, xattrs, ownership (uid/gid), Windows ADS streams, and resource forks are *not* preserved.
 - **No compression, encryption, or block-level dedup**. A small change in a large file means another full copy in that day's snapshot.
 - **No verify command** to check the mirror against the source byte-for-byte. The state-file diff catches size + mtime changes but won't detect silent bit-rot on the backup drive.
 - **Two sources with the same last path component collide** in the mirror (`/home/a/Docs` and `/home/b/Docs` both map to `Docs/...`). Rename or restructure to give each source a distinct top-level name.
 
 ## Tests
 
+The suite is black-box: it invokes `dabbak.scm` as a subprocess and asserts on the resulting filesystem, exit codes and output (it does not import the script's internals).
+
 ```bash
-python -m unittest discover -s tests
+scm  test-dabbak.scm
+scmj test-dabbak.scm   # Java build
 ```
 
-The test suite is stdlib-only and runs identically on Linux, macOS, and Windows.
+It runs identically under both dabscm interpreters on Linux, macOS, and Windows.
 
 ## License
 

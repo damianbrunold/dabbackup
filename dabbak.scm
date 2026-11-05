@@ -22,18 +22,18 @@
 ;; for the Tkinter GUI.
 
 (import (scheme base)
-        (scheme write)
         (scheme file)
         (scheme process-context)
+        (scheme write)
         (srfi 1)
-        (srfi 13)
+        (except (srfi 13) string-hash)
         (srfi 69)
         (srfi 132)
-        (scm fs)
-        (scm system)
-        (scm string)
         (scm datetime)
-        (scm json simple))
+        (scm fs)
+        (scm json simple)
+        (scm string)
+        (scm system))
 
 ;; ======================================================================
 ;; Small utilities
@@ -452,8 +452,7 @@
          (pg-enabled (not json-out))
          (pg-files 0)
          (pg-bytes 0)
-         (pg-last 0)
-         (pg-total (hash-table-size state)))
+         (pg-last 0))
 
     (define (sget k) (hash-table-ref/default stats k 0))
     (define (sset! k v) (hash-table-set! stats k v))

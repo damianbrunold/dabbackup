@@ -9,7 +9,8 @@
 ;; Usage:
 ;;   scm dabbak.scm <command> [options]
 ;; Commands:
-;;   init | backup | restore | list | prune | package | refresh-state | config
+;;   init | backup | restore | list | prune | squash | package |
+;;   refresh-state | config
 ;;
 ;; Drop-in compatible with the Python version: same config file, same
 ;; JSON state format ({path: [size, seconds]}), same snapshot layout
@@ -784,6 +785,49 @@
       stats-alist)))
 
 ;; ======================================================================
+;; snapshot history (shared by restore / package / squash)
+;; ======================================================================
+
+;; marker / metadata files that live at the root of a dated snapshot dir.
+;;   __state.json   full state as of this snapshot (complete runs only)
+;;   __incomplete   the run was interrupted: not a restore point
+;;   __squashed     being merged into a later snapshot: not a restore point,
+;;                  but its files are still searched (crash-safe squash)
+;;   __squash.json  journal on the squash TARGET: {target, sources}
+(define SNAPSHOT-META-FILES
+  '("__state.json" "__incomplete" "__squashed" "__squash.json"))
+
+(define (snapshot-meta-file? name) (member name SNAPSHOT-META-FILES))
+
+;; a snapshot that restore may use as its point in time (has a state, was
+;; not interrupted, is not the source of a pending squash).
+(define (snapshot-complete? dir)
+  (and (file-exists? (join-path dir "__state.json"))
+       (not (path-exists? (join-path dir "__incomplete")))
+       (not (path-exists? (join-path dir "__squashed")))))
+
+;; dated snapshot dir names under partial-dir, newest first.
+(define (dated-snapshot-names partial-dir)
+  (filter (lambda (h)
+            (and (valid-date-string? h)
+                 (directory-exists? (join-path partial-dir h))))
+          (names-sorted-desc partial-dir)))
+
+;; (point . search) for a restore at `timestamp` over snapshots newer than
+;; `cutoff`: point = newest complete snapshot <= timestamp, search = every
+;; dated dir in (cutoff, point], newest first. Incomplete and squash-source
+;; dirs are searched for file copies (their files are versions the later
+;; state references) but are never the point itself. #f if no point.
+(define (snapshot-history partial-dir timestamp cutoff)
+  (let* ((dirs (filter (lambda (h)
+                         (and (string<=? h timestamp) (string>? h cutoff)))
+                       (dated-snapshot-names partial-dir)))
+         (point (find (lambda (h)
+                        (snapshot-complete? (join-path partial-dir h)))
+                      dirs)))
+    (and point (cons point (filter (lambda (h) (string<=? h point)) dirs)))))
+
+;; ======================================================================
 ;; restore
 ;; ======================================================================
 
@@ -805,18 +849,13 @@
                         " exists, abort (use --force to merge into it)"))
     (exit 1))
   (let* ((partial-dir (config-dest-partial config))
-         (history (filter (lambda (h)
-                            (and (string<=? h timestamp)
-                                 (directory-exists? (join-path partial-dir h))
-                                 (not (path-exists?
-                                       (join-path partial-dir h
-                                                  "__incomplete")))))
-                          (names-sorted-desc partial-dir))))
-    (when (null? history)
+         (hist (snapshot-history partial-dir timestamp "0000-00-00")))
+    (unless hist
       (prn (string-append "ERR: no usable snapshot at or before " timestamp))
       (exit 1))
-    (let ((full-state (read-full-state-file
-                       (join-path partial-dir (car history) "__state.json")))
+    (let ((history (cdr hist))
+          (full-state (read-full-state-file
+                       (join-path partial-dir (car hist) "__state.json")))
           (restored 0)
           (missing 0))
       (for-each (lambda (pr)
@@ -903,20 +942,12 @@
                                "0000-00-00")
                            "0000-00-00"))))
          (partial-dir (config-dest-partial config))
-         (history (filter (lambda (h)
-                            (and (string<=? h timestamp)
-                                 (string>? h cutoff)
-                                 (directory-exists? (join-path partial-dir h))
-                                 (not (path-exists?
-                                       (join-path partial-dir h
-                                                  "__incomplete")))))
-                          (names-sorted-desc partial-dir))))
-    (if (null? history)
+         (hist (snapshot-history partial-dir timestamp cutoff)))
+    (if (not hist)
         (prn "done")
-        (let ((full-state (read-full-state-file
-                           (join-path partial-dir
-                                      (car history)
-                                      "__state.json")))
+        (let ((history (cdr hist))
+              (full-state (read-full-state-file
+                           (join-path partial-dir (car hist) "__state.json")))
               (index 1)
               (size 0))
           (define (destbase)
@@ -1025,8 +1056,9 @@
                               (lambda (path)
                                 (let ((base (base-name path)))
                                   (unless
-                                      (or (string=? base "__state.json")
-                                          (string=? base "__incomplete"))
+                                      (and
+                                       (string=? (directory-name path) full)
+                                       (snapshot-meta-file? base))
                                     (set! files (+ files 1))
                                     (set!
                                      bytes-total
@@ -1074,11 +1106,18 @@
                      (string-pad "size" 10)
                      "  status")
                 (for-each (lambda (s)
-                            (let
-                                ((status
-                                  (if (snap-field s "incomplete")
-                                      "incomplete"
-                                      "ok")))
+                            (let ((status
+                                   (let ((dir (snap-field s "path")))
+                                     (cond
+                                      ((path-exists?
+                                        (join-path dir "__squashed"))
+                                       "squash pending (source)")
+                                      ((path-exists?
+                                        (join-path dir "__squash.json"))
+                                       "squash pending (target)")
+                                      ((snap-field s "incomplete")
+                                       "incomplete")
+                                      (else "ok")))))
                               (prn (string-pad-right (snap-field s "date") 12)
                                    " "
                                    (string-pad
@@ -1093,88 +1132,403 @@
                           snaps)))))
 
 ;; ======================================================================
-;; prune
+;; squash (merge-forward) — the engine behind `squash` and `prune`
+;;
+;; Removing snapshots R in favour of a later complete snapshot K keeps every
+;; restore point >= K identical: restore takes, per path, the newest copy at
+;; or before its point. So, walking R newest-first, each file S/rel is
+;;   - dropped if K already has rel (K's copy, or one moved earlier, is newer)
+;;   - moved to K/rel if rel is still in K's __state.json
+;;   - dropped otherwise (deleted from the source before K: no restore >= K
+;;     asks for it, and a reappearing file is copied afresh by backup)
+;; Crash safety: K/__squash.json (the job) is written and every source gets
+;; a __squashed marker before anything moves. Sources stop being restore
+;; points but are still searched, so a restore at K is correct at every
+;; intermediate step. An interrupted job is finished by the next
+;; `squash` / `prune --force`.
+;; ======================================================================
+
+(define (slashify s) (string-replace-all s "\\" "/"))
+
+;; hash set of "/"-separated relpaths referenced by K's __state.json.
+(define (snapshot-relpath-set config k-dir)
+  (let ((set (make-hash-table)))
+    (for-each (lambda (pr)
+                (let* ((fullpath (car pr))
+                       (prefix (find-source-prefix config fullpath)))
+                  (when prefix
+                    (hash-table-set! set
+                                     (slashify
+                                      (substring fullpath
+                                                 (compute-prefixlen prefix)
+                                                 (string-length fullpath)))
+                                     #t))))
+              (read-full-state-file (join-path k-dir "__state.json")))
+    set))
+
+(define (make-squash-stats)
+  (let ((h (make-hash-table)))
+    (for-each (lambda (k) (hash-table-set! h k 0))
+              '(moved dropped bytes-freed errors))
+    h))
+(define (stat-ref st k) (hash-table-ref/default st k 0))
+(define (stat-add! st k n) (hash-table-set! st k (+ (stat-ref st k) n)))
+
+;; move one file, falling back to copy + delete. #t on success.
+(define (move-or-copy src dst)
+  (guard (e (#t
+             (guard (e2 (#t #f))
+               (copy-file src dst)
+               (delete-file src)
+               #t)))
+    (move-file src dst)
+    #t))
+
+;; merge source snapshot dir s-dir into k-dir. `claimed` holds the relpaths
+;; already present in / moved into K (it also makes dry-run counts exact).
+;; s-dir is deleted afterwards unless a file could not be handled.
+(define (merge-snapshot-into! s-dir k-dir relset claimed dry-run stats)
+  (let ((s-prefixlen (compute-prefixlen s-dir))
+        (errors 0))
+    (define (drop! path size)
+      (stat-add! stats 'dropped 1)
+      (stat-add! stats 'bytes-freed size)
+      (unless dry-run
+        (unless (guard (e (#t #f))
+                  (delete-file path)
+                  #t)
+          (prn (string-append "ERR: failed to delete " path))
+          (set! errors (+ errors 1)))))
+    (walk-files s-dir
+                (lambda (p)
+                  (and (string=? (directory-name p) s-dir)
+                       (snapshot-meta-file? (base-name p))))
+                (lambda (path)
+                  (let* ((rel (substring path s-prefixlen
+                                         (string-length path)))
+                         (key (slashify rel))
+                         (dst (join-path k-dir rel))
+                         (size (guard (e (#t 0)) (file-size path))))
+                    (cond ((or (hash-table-exists? claimed key)
+                               (path-exists? dst))
+                           (hash-table-set! claimed key #t)
+                           (drop! path size))
+                          ((hash-table-exists? relset key)
+                           (hash-table-set! claimed key #t)
+                           (stat-add! stats 'moved 1)
+                           (unless dry-run
+                             (make-directory (directory-name dst))
+                             (unless (move-or-copy path dst)
+                               (prn (string-append "ERR: failed to move " path
+                                                   " -> " dst))
+                               (hash-table-delete! claimed key)
+                               (set! errors (+ errors 1)))))
+                          (else (drop! path size))))))
+    (unless (or dry-run (> errors 0))
+      (guard
+          (e (#t
+              (prn (string-append "ERR: failed to remove " s-dir ": "
+                                  (err->string e)))
+              (set! errors (+ errors 1))))
+        (delete-directory s-dir)))
+    (stat-add! stats 'errors errors)
+    (= errors 0)))
+
+;; prepend the sources' partial logs (oldest first) to the target's log so
+;; the history of what was backed up when is not lost, then drop them.
+(define (merge-snapshot-logs! partial-dir target sources)
+  (let* ((k-log (get-partial-log partial-dir target))
+         (src-logs (filter (lambda (pr) (file-exists? (cdr pr)))
+                           (map (lambda (d)
+                                  (cons d (get-partial-log partial-dir d)))
+                                (list-sort string<? sources)))))
+    (when (pair? src-logs)
+      (guard
+          (e (#t
+              (prn (string-append "WARN: could not merge logs into " k-log
+                                  ": "
+                                  (err->string e)))))
+        (let ((tmp (string-append k-log ".tmp")))
+          (call-with-output-file tmp
+            (lambda (p)
+              (for-each (lambda (pr)
+                          (display (string-append "== squashed from "
+                                                  (car pr)
+                                                  " ==\n")
+                                   p)
+                          (display (read-file->string (cdr pr)) p))
+                        src-logs)
+              (when (file-exists? k-log)
+                (display (string-append "== " target " ==\n") p)
+                (display (read-file->string k-log) p))))
+          (move-file tmp k-log)
+          (for-each (lambda (pr) (delete-file (cdr pr))) src-logs))))))
+
+;; run (or resume) one job: merge `sources` (dates) into `target` (date).
+;; Returns the stats table.
+(define (run-squash-job! config target sources dry-run)
+  (let* ((partial-dir (norm-path (config-dest-partial config)))
+         (k-dir (join-path partial-dir target))
+         (journal (join-path k-dir "__squash.json"))
+         (stats (make-squash-stats))
+         (relset (snapshot-relpath-set config k-dir))
+         (claimed (make-hash-table))
+         (existing (filter (lambda (d)
+                             (directory-exists? (join-path partial-dir d)))
+                           sources)))
+    (unless dry-run
+      (call-with-output-file journal
+        (lambda (p)
+          (json-write-pretty (list (cons "target" target)
+                                   (cons "sources" (list->vector sources)))
+                             p)))
+      (for-each (lambda (d)
+                  (call-with-output-file
+                      (join-path partial-dir d "__squashed")
+                    (lambda (p) (display target p))))
+                existing))
+    (for-each (lambda (d)
+                (merge-snapshot-into! (join-path partial-dir d)
+                                      k-dir
+                                      relset
+                                      claimed
+                                      dry-run
+                                      stats))
+              (list-sort string>? existing))
+    (unless dry-run
+      (merge-snapshot-logs! partial-dir target sources)
+      (when (= (stat-ref stats 'errors) 0)
+        (guard (e (#t #f)) (delete-file journal))))
+    stats))
+
+;; finish any job a previous run left behind (a __squash.json on a target).
+(define (resume-pending-squash! config)
+  (let ((partial-dir (norm-path (config-dest-partial config))))
+    (for-each (lambda (target)
+                (let
+                    ((journal (join-path partial-dir target "__squash.json")))
+                  (when (file-exists? journal)
+                    (let
+                        ((sources (vector->list
+                                   (aget (read-json-file journal)
+                                         "sources"))))
+                      (prn (string-append "resuming interrupted squash into "
+                                          target))
+                      (run-squash-job! config target sources #f)))))
+              (list-sort string<? (dated-snapshot-names partial-dir)))))
+
+(define (pending-squash? partial-dir)
+  (any (lambda (d) (file-exists? (join-path partial-dir d "__squash.json")))
+       (dated-snapshot-names partial-dir)))
+
+;; group snapshots (dates, any order) into jobs ((target . sources) ...):
+;; every snapshot not in `kept` is merged into the next kept one after it.
+;; Snapshots after the last kept one are left alone.
+(define (plan-squash-jobs dates kept)
+  (let loop ((ds (list-sort string<? dates))
+             (pending '())
+             (jobs '()))
+    (cond ((null? ds) (reverse jobs))
+          ((member (car ds) kept)
+           (loop (cdr ds)
+                 '()
+                 (if (null? pending)
+                     jobs
+                     (cons (cons (car ds) (reverse pending)) jobs))))
+          (else (loop (cdr ds) (cons (car ds) pending) jobs)))))
+
+(define (jobs-sources jobs) (append-map cdr jobs))
+
+;; ======================================================================
+;; squash command: merge every snapshot in [from, to] into the newest
+;; complete snapshot in that range.
+;; ======================================================================
+
+(define (do-squash config from to force json-out)
+  (let* ((partial-dir (norm-path (config-dest-partial config)))
+         (_ (when force (resume-pending-squash! config)))
+         (in-range (filter (lambda (d)
+                             (and (string>=? d from) (string<=? d to)))
+                           (dated-snapshot-names partial-dir)))
+         (target (find (lambda (d)
+                         (snapshot-complete? (join-path partial-dir d)))
+                       in-range))
+         (sources (if target
+                      (list-sort string<?
+                                 (filter (lambda (d) (string<? d target))
+                                         in-range))
+                      '()))
+         (stats (if (pair? sources)
+                    (run-squash-job! config target sources (not force))
+                    (make-squash-stats))))
+    (if json-out
+        (begin
+          (json-write-pretty (list (cons "target" (or target 'null))
+                                   (cons "sources" (list->vector sources))
+                                   (cons "moved" (stat-ref stats 'moved))
+                                   (cons "dropped" (stat-ref stats 'dropped))
+                                   (cons "bytes_freed"
+                                         (stat-ref stats 'bytes-freed))
+                                   (cons "error_count"
+                                         (stat-ref stats 'errors))
+                                   (cons "force" force))
+                             (current-output-port))
+          (newline))
+        (cond ((null? sources)
+               (prn (string-append "nothing to squash in " from " .. " to)))
+              (else (unless force (prn "DRY RUN (no --force)."))
+                    (prn (string-append (if force "merged " "would merge ")
+                                        (number->string (length sources))
+                                        " snapshot(s) into "
+                                        target
+                                        ":"))
+                    (for-each (lambda (d) (prn "  " d)) sources)
+                    (print-squash-summary stats force))))
+    (when (> (stat-ref stats 'errors) 0) (exit 1))))
+
+(define (print-squash-summary stats force)
+  (prn (string-append (if force "moved " "would move ")
+                      (group-digits (stat-ref stats 'moved))
+                      " file(s) forward, "
+                      (if force "dropped " "drop ")
+                      (group-digits (stat-ref stats 'dropped))
+                      " superseded/deleted file(s), "
+                      (if force "freed " "freeing ")
+                      (format-size (stat-ref stats 'bytes-freed))))
+  (when (> (stat-ref stats 'errors) 0)
+    (prn (string-append "ERR: "
+                        (number->string (stat-ref stats 'errors))
+                        " error(s); rerun to finish the squash"))))
+
+;; ======================================================================
+;; prune: retention policy, then merge-forward of everything not kept
 ;; ======================================================================
 
 (define (date->seconds s) (parse-iso8601 s))
 
-(define (select-snapshots-to-prune snaps keep-last keep-days today)
+;; dates (from snaps, newest first) kept by the policy. Only complete
+;; snapshots can be kept (they are the restore points); incomplete ones are
+;; folded into the next kept snapshot. A count of 'all means unlimited.
+;; Always kept: today's snapshot and the newest complete snapshot.
+(define
+    (select-kept-snapshots snaps keep-last keep-days keep-monthly keep-yearly
+                           today)
   (let* ((today-sec (date->seconds today))
-         (cutoff-sec (and keep-days (- today-sec (* keep-days 86400)))))
-    (let loop ((ss snaps) (i 0) (acc '()))
+         (cutoff-sec (and keep-days
+                          (not (eq? keep-days 'all))
+                          (- today-sec (* keep-days 86400))))
+         (complete (filter (lambda (s)
+                             (snapshot-complete? (snap-field s "path")))
+                           snaps))
+         (months (make-hash-table))
+         (years (make-hash-table)))
+    (define (within? n count) (or (eq? n 'all) (and n (<= count n))))
+    ;; first (newest) snapshot of a bucket counts if the bucket is among the
+    ;; n most recent buckets.
+    (define (bucket-keep? table key n)
+      (and n
+           (not (hash-table-exists? table key))
+           (begin
+             (hash-table-set! table key #t)
+             (within? n (hash-table-size table)))))
+    (let loop ((ss complete) (i 0) (acc '()))
       (if (null? ss)
           (reverse acc)
-          (let* ((s (car ss))
-                 (date (snap-field s "date")))
-            (if (string=? date today)
-                (loop (cdr ss) (+ i 1) acc)
-                (let ((keep #f))
-                  (when (and keep-last (< i keep-last)) (set! keep #t))
-                  (when cutoff-sec
-                    (let ((sec (date->seconds date)))
-                      (if (and sec (>= sec cutoff-sec)) (set! keep #t))))
-                  (loop (cdr ss) (+ i 1) (if keep acc (cons s acc))))))))))
+          (let* ((date (snap-field (car ss) "date"))
+                 (sec (date->seconds date))
+                 (m (bucket-keep? months (substring date 0 7) keep-monthly))
+                 (y (bucket-keep? years (substring date 0 4) keep-yearly))
+                 (keep (or (string=? date today)
+                           (= i 0)
+                           (and keep-last (within? keep-last (+ i 1)))
+                           (eq? keep-days 'all)
+                           (and cutoff-sec sec (>= sec cutoff-sec))
+                           m
+                           y)))
+            (loop (cdr ss) (+ i 1) (if keep (cons date acc) acc)))))))
 
-(define (do-prune config keep-last keep-days force json-out)
-  (let* ((partial (norm-path (config-dest-partial config)))
-         (snaps (enumerate-snapshots partial))
-         (to-delete (select-snapshots-to-prune snaps keep-last keep-days
-                                               (today-str)))
-         (del-dates (map (lambda (s) (snap-field s "date")) to-delete))
-         (kept (filter-map (lambda (s)
-                             (and (not (member (snap-field s "date")
-                                               del-dates))
-                                  (snap-field s "date")))
-                           snaps))
-         (deleted '()))
-    (if (not force)
-        (begin
-          (unless json-out
-            (prn (string-append "DRY RUN (no --force). Would delete "
-                                (number->string (length to-delete))
-                                " snapshot(s):"))
-            (for-each (lambda (s)
-                        (prn (string-append
-                              "  "
-                              (snap-field s "date")
-                              "  "
-                              (group-digits (snap-field s "file_count"))
-                              " files  "
-                              (format-size (snap-field s "total_bytes")))))
-                      to-delete)
-            (prn (string-append "Would keep "
-                                (number->string
-                                 (- (length snaps) (length to-delete)))
-                                " snapshot(s).")))
-          (when json-out (print-prune-json kept '() del-dates force)))
-        (begin
-          (for-each (lambda (s)
-                      (guard
-                          (e (#t
-                              (unless json-out
-                                (prn (string-append "ERR: failed to remove "
-                                                    (snap-field s "path")
-                                                    ": "
-                                                    (err->string e))))))
-                        (delete-directory (snap-field s "path"))
-                        (when (path-exists? (snap-field s "log"))
-                          (guard (e2 (#t #f))
-                            (delete-file (snap-field s "log"))))
-                        (set! deleted (cons (snap-field s "date") deleted))
-                        (unless json-out
-                          (prn (string-append "deleted "
-                                              (snap-field s "date"))))))
-                    to-delete)
-          (when json-out
-            (print-prune-json kept (reverse deleted) del-dates force))))))
-
-(define (print-prune-json kept deleted would-delete force)
-  (json-write-pretty (list (cons "kept" (list->vector kept))
-                           (cons "deleted" (list->vector deleted))
-                           (cons "would_delete" (list->vector would-delete))
-                           (cons "force" force))
-                     (current-output-port))
-  (newline))
+(define
+    (do-prune config keep-last keep-days keep-monthly keep-yearly force
+              json-out)
+  (let ((partial (norm-path (config-dest-partial config))))
+    (when force (resume-pending-squash! config))
+    (when (and (not force) (not json-out) (pending-squash? partial))
+      (prn "NOTE: an interrupted squash is pending; --force finishes it"))
+    (let* ((snaps (enumerate-snapshots partial))
+           (dates (map (lambda (s) (snap-field s "date")) snaps))
+           (kept-dates (select-kept-snapshots snaps keep-last keep-days
+                                              keep-monthly
+                                              keep-yearly
+                                              (today-str)))
+           (jobs (plan-squash-jobs dates kept-dates))
+           (del-dates (list-sort string>? (jobs-sources jobs)))
+           (kept (filter (lambda (d) (not (member d del-dates))) dates))
+           (into (append-map (lambda (j)
+                               (map (lambda (d) (cons d (car j))) (cdr j)))
+                             jobs))
+           (stats (make-squash-stats)))
+      (define (snap-of d)
+        (find (lambda (s) (string=? (snap-field s "date") d)) snaps))
+      (when force
+        (for-each (lambda (j)
+                    (let ((st (run-squash-job! config (car j) (cdr j) #f)))
+                      (for-each (lambda (k)
+                                  (stat-add! stats k (stat-ref st k)))
+                                '(moved dropped bytes-freed errors))
+                      (unless json-out
+                        (for-each (lambda (d)
+                                    (unless
+                                        (directory-exists?
+                                         (join-path partial d))
+                                      (prn
+                                       (string-append "deleted " d
+                                                      " (merged into "
+                                                      (car j)
+                                                      ")"))))
+                                  (cdr j)))))
+                  jobs))
+      (let
+          ((deleted (filter (lambda (d)
+                              (not (directory-exists? (join-path partial d))))
+                            del-dates)))
+        (cond (json-out (json-write-pretty
+                         (list (cons "kept" (list->vector kept))
+                               (cons "deleted"
+                                     (list->vector (if force deleted '())))
+                               (cons "would_delete" (list->vector del-dates))
+                               (cons "squashed_into"
+                                     (list-sort
+                                      (lambda (a b)
+                                        (string>? (car a) (car b)))
+                                      into))
+                               (cons "bytes_freed"
+                                     (stat-ref stats 'bytes-freed))
+                               (cons "force" force))
+                         (current-output-port))
+                        (newline))
+              (force (when (pair? jobs) (print-squash-summary stats #t)))
+              (else (prn (string-append "DRY RUN (no --force). Would delete "
+                                        (number->string (length del-dates))
+                                        " snapshot(s), merging what later"
+                                        " snapshots still need into them:"))
+                    (for-each (lambda (d)
+                                (let ((s (snap-of d)))
+                                  (prn (string-append
+                                        "  "
+                                        d
+                                        "  "
+                                        (group-digits
+                                         (snap-field s "file_count"))
+                                        " files  "
+                                        (format-size
+                                         (snap-field s "total_bytes"))
+                                        "  -> "
+                                        (cdr (assoc d into))))))
+                              del-dates)
+                    (prn (string-append "Would keep "
+                                        (number->string (length kept))
+                                        " snapshot(s).")))))
+      (when (> (stat-ref stats 'errors) 0) (exit 1)))))
 
 ;; ======================================================================
 ;; refresh-state
@@ -1302,40 +1656,84 @@
                  (exit 2))
                 (else (loop (cdr args) (cons a pos) full force)))))))
 
+;; a retention count: a non-negative integer, or "all" (unlimited).
+(define (parse-count cmd opt str allow-all)
+  (cond ((and allow-all (string=? str "all")) 'all)
+        ((let ((n (string->number str)))
+           (and n (exact-integer? n) (>= n 0) n)))
+        (else (eprint cmd ": " opt " needs a non-negative integer"
+                      (if allow-all " or 'all'" "")
+                      ", got "
+                      str)
+              (exit 2))))
+
 (define (cmd-prune config rest)
-  (let loop ((args rest) (kl #f) (kd #f) (force #f) (json #f))
+  (let loop ((args rest) (opts '()) (force #f) (json #f))
+    (define (opt k) (let ((p (assq k opts))) (and p (cdr p))))
     (if (null? args)
-        (if (and (not kl) (not kd))
+        (if (null? opts)
             (begin
-              (eprint "prune: must specify --keep-last and/or --keep-days")
+              (eprint "prune: must specify --keep-last, --keep-days,"
+                      " --keep-monthly and/or --keep-yearly")
+              (exit 2))
+            (let
+                ((run (lambda (f)
+                        (do-prune config
+                                  (opt 'last)
+                                  (opt 'days)
+                                  (opt 'monthly)
+                                  (opt 'yearly)
+                                  f
+                                  json))))
+              (if force (with-lock config (lambda () (run #t))) (run #f))))
+        (let* ((a (car args))
+               (key (cond ((string=? a "--keep-last") 'last)
+                          ((string=? a "--keep-days") 'days)
+                          ((string=? a "--keep-monthly") 'monthly)
+                          ((string=? a "--keep-yearly") 'yearly)
+                          (else #f))))
+          (cond (key (when (null? (cdr args))
+                       (eprint "prune: " a " needs a value")
+                       (exit 2))
+                     (loop (cddr args)
+                           (cons (cons key
+                                       (parse-count
+                                        "prune"
+                                        a
+                                        (cadr args)
+                                        (memq key '(monthly yearly))))
+                                 opts)
+                           force
+                           json))
+                ((string=? a "--force") (loop (cdr args) opts #t json))
+                ((string=? a "--json") (loop (cdr args) opts force #t))
+                (else (eprint "prune: unknown argument " a) (exit 2)))))))
+
+(define (cmd-squash config rest)
+  (let loop ((args rest) (from #f) (to #f) (force #f) (json #f))
+    (if (null? args)
+        (if (not (and from to))
+            (begin
+              (eprint "squash: --from YYYY-MM-DD and --to YYYY-MM-DD are"
+                      " required")
               (exit 2))
             (if force
-                (with-lock config (lambda () (do-prune config kl kd #t json)))
-                (do-prune config kl kd #f json)))
+                (with-lock config
+                  (lambda () (do-squash config from to #t json)))
+                (do-squash config from to #f json)))
         (let ((a (car args)))
-          (cond ((string=? a "--keep-last")
-                 (if (null? (cdr args))
-                     (begin
-                       (eprint "prune: --keep-last needs a value")
-                       (exit 2))
-                     (loop (cddr args)
-                           (string->number (cadr args))
-                           kd
-                           force
-                           json)))
-                ((string=? a "--keep-days")
-                 (if (null? (cdr args))
-                     (begin
-                       (eprint "prune: --keep-days needs a value")
-                       (exit 2))
-                     (loop (cddr args)
-                           kl
-                           (string->number (cadr args))
-                           force
-                           json)))
-                ((string=? a "--force") (loop (cdr args) kl kd #t json))
-                ((string=? a "--json") (loop (cdr args) kl kd force #t))
-                (else (eprint "prune: unknown argument " a) (exit 2)))))))
+          (cond ((or (string=? a "--from") (string=? a "--to"))
+                 (when
+                     (or (null? (cdr args))
+                         (not (valid-date-string? (cadr args))))
+                   (eprint "squash: " a " needs a date YYYY-MM-DD")
+                   (exit 2))
+                 (if (string=? a "--from")
+                     (loop (cddr args) (cadr args) to force json)
+                     (loop (cddr args) from (cadr args) force json)))
+                ((string=? a "--force") (loop (cdr args) from to #t json))
+                ((string=? a "--json") (loop (cdr args) from to force #t))
+                (else (eprint "squash: unknown argument " a) (exit 2)))))))
 
 (define (cmd-list-cmd config rest)
   (let loop ((args rest) (json #f))
@@ -1362,7 +1760,7 @@
 (define (usage)
   (eprint "usage: scm dabbak.scm <command> [options]")
   (eprint
-   "commands: init backup restore list prune package refresh-state config"))
+   "commands: init backup restore list prune squash package refresh-state config"))
 
 (define (main argv)
   (if (null? argv)
@@ -1388,6 +1786,7 @@
                             ((string=? cmd "config") (cmd-config config))
                             ((string=? cmd "list") (cmd-list-cmd config rest))
                             ((string=? cmd "prune") (cmd-prune config rest))
+                            ((string=? cmd "squash") (cmd-squash config rest))
                             (else (eprint "error: unknown command " cmd)
                                   (usage)
                                   (exit 2)))))))))

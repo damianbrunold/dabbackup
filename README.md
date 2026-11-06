@@ -143,7 +143,7 @@ dabbak backup [--dry-run] [-q|--quiet] [--json]
 
 **Exit codes:** 0 on success (including with copy errors logged); 1 if another dabbak run holds the lock; 2 on argument errors.
 
-**Failure handling:** if dabbak is interrupted mid-run (Ctrl-C, USB unplug, network share drop), state is *merged* rather than truncated — entries for paths not yet visited are preserved from the previous state. The deletion pass is skipped. Today's snapshot folder gets an `__incomplete` marker so `restore` and `package` ignore it. Re-running `backup` resumes naturally.
+**Failure handling:** if dabbak is interrupted mid-run (Ctrl-C, USB unplug, network share drop), state is *merged* rather than truncated — entries for paths not yet visited are preserved from the previous state. The deletion pass is skipped. Today's snapshot folder gets an `__incomplete` marker so `restore` and `package` never use it as a restore point (the files it did copy are still found by later restores). Re-running `backup` resumes naturally.
 
 ---
 
@@ -165,7 +165,7 @@ dabbak restore <dest_dir> [-t YYYY-MM-DD] [pattern ...] [--dry-run] [--force]
 
 **Back-compat:** the legacy positional form `dabbak restore /tmp/out 2024-03-15 /home/me/Docs` still works — a first positional matching `YYYY-MM-DD` is interpreted as a timestamp.
 
-**How dates are resolved:** dabbak loads `__state.json` from the newest *valid* snapshot at or before the requested date (snapshots with an `__incomplete` marker are skipped) and uses it as the file manifest. For each listed file, it walks the snapshot history newest-first and copies the first version it finds.
+**How dates are resolved:** dabbak loads `__state.json` from the newest *complete* snapshot at or before the requested date and uses it as the file manifest. Snapshots with an `__incomplete` or `__squashed` marker are never used as the manifest. For each listed file, it walks the snapshot history newest-first, from that snapshot back, and copies the first version it finds. Incomplete and squash-source snapshots are included in that search, because the files they hold are versions the later manifest refers to.
 
 ---
 
@@ -177,28 +177,58 @@ Show the partial snapshots that exist.
 dabbak list [--json]
 ```
 
-Prints a table of `date / files / size / status` (where `status` is `ok` or `incomplete`). `--json` emits a machine-readable array.
+Prints a table of `date / files / size / status` (where `status` is `ok`, `incomplete`, or `squash pending (source|target)` after an interrupted squash). `--json` emits a machine-readable array.
 
 ---
 
 ### `prune`
 
-Delete old partial snapshots according to a retention policy.
+Thin out old partial snapshots according to a retention policy.
 
 ```
-dabbak prune [--keep-last N] [--keep-days N] [--force] [--json]
+dabbak prune [--keep-last N] [--keep-days N] [--keep-monthly N] [--keep-yearly N] [--force] [--json]
 ```
 
 | Flag | Description |
 |---|---|
 | `--keep-last N` | Keep the N most recent snapshots. |
 | `--keep-days N` | Keep snapshots dated within the last N days. |
-| `--force` | Actually delete. Without this, prune is a **dry-run** that prints what it would do. |
-| `--json` | JSON output. |
+| `--keep-monthly N` | Keep the last snapshot of each of the N most recent months (`all` = every month). |
+| `--keep-yearly N` | Keep the last snapshot of each of the N most recent years (`all` = every year). |
+| `--force` | Actually prune. Without this, prune is a **dry-run** that prints what it would do. |
+| `--json` | JSON output (`kept`, `deleted`, `would_delete`, `squashed_into`, `bytes_freed`, `force`). |
 
-A snapshot is kept if it satisfies **either** policy (union, not intersection). Today's snapshot is always kept regardless. Pruning deletes the dated snapshot folder *and* its `backup-partial-YYYY-MM-DD.log` together.
+A snapshot is kept if it satisfies **any** policy (union, not intersection). Today's snapshot and the newest complete snapshot are always kept. Only complete snapshots count as kept: incomplete ones are always folded into the next kept snapshot.
 
-You must specify at least one of `--keep-last` or `--keep-days`.
+Snapshots that aren't kept are **squashed into the next kept snapshot** (see `squash` below), not simply deleted. A partial snapshot holds only the files that changed that day, so deleting one would lose the only copy of every file that hasn't changed since. Restore at every kept date gives the same result before and after pruning. The removed snapshot's `backup-partial-YYYY-MM-DD.log` is prepended to the kept snapshot's log under a `== squashed from YYYY-MM-DD ==` header.
+
+You must specify at least one `--keep-*` option. A typical policy is "daily for 3 months, then monthly for 2 years, then yearly forever":
+
+```
+dabbak prune --keep-days 90 --keep-monthly 24 --keep-yearly all --force
+```
+
+---
+
+### `squash`
+
+Merge every snapshot in a date range into the newest complete snapshot in that range. Example: compact all of 2025 into one snapshot, dated at the last backup of 2025.
+
+```
+dabbak squash --from YYYY-MM-DD --to YYYY-MM-DD [--force] [--json]
+```
+
+For each file in the merged snapshots, processed newest-first:
+
+- if the target already has a copy (one it had, or a newer one already moved in), the older copy is **dropped**;
+- if the target's `__state.json` still lists the file, it is **moved** into the target (a rename, so no data is copied);
+- otherwise the file was deleted from the source before the target date, nothing at or after the target can need it, and it is **dropped**.
+
+Restore points inside the range are gone afterwards. Points before the range, and points at or after the target, give exactly the same result as before. The space you get back is every intermediate version within the range plus every file deleted within it. Data that changes a lot shrinks a lot. Data that only ever grows (e.g. a photo archive) shrinks very little, because the latest version of every live file has to stay somewhere.
+
+Incomplete snapshots inside the range are folded in like any other. Incomplete snapshots newer than the target are left alone. Without `--force` it is a dry-run that reports what would be moved, dropped and freed.
+
+**Crash safety:** before anything moves, the target gets a `__squash.json` job file and each source gets a `__squashed` marker. Sources then stop being restore points, but restore still searches them for copies, so a restore at the target is correct at every intermediate step. If a squash is interrupted, `list` shows `squash pending`, and the next `squash --force` or `prune --force` finishes the job first.
 
 ---
 
@@ -256,8 +286,9 @@ The Scheme port is **CLI-only** — the dabscm runtime ships no windowing toolki
 # Backup every night at 02:00, log everything to a sibling file
 0 2 * * *  cd /opt/dabbak && scm dabbak.scm backup --quiet >> /var/log/dabbak.log 2>&1
 
-# Once a week, prune snapshots older than 90 days
-0 3 * * 0  cd /opt/dabbak && scm dabbak.scm prune --keep-days 90 --force --json >> /var/log/dabbak.log
+# Once a week: keep 90 days of daily snapshots, then one per month for two
+# years, then one per year (older snapshots are squashed, not just deleted)
+0 3 * * 0  cd /opt/dabbak && scm dabbak.scm prune --keep-days 90 --keep-monthly 24 --keep-yearly all --force --json >> /var/log/dabbak.log
 ```
 
 The per-config lockfile guarantees a manual `dabbak backup` and the cron job can't run at the same time.
@@ -343,6 +374,38 @@ DABBAK_CONFIG=backup-photos.json scm dabbak.scm backup
 
 Each config has its own state file → its own lock → the two can run concurrently.
 
+### Keeping the history on external media
+
+A common setup is to copy the partial history to an external drive with [dabsync](https://github.com/dab/dabsync):
+
+```bash
+scm dabsync.scm copy /backup/partial /media/usb/partial
+```
+
+`dabsync copy` only adds and updates files and **never deletes**. So pruning or squashing locally does **not** remove anything from the external copy:
+
+- The pruned snapshot folders and their logs stay on the media.
+- The kept snapshot also gets the files that prune moved into it locally, plus its updated log. Each moved file then exists twice on the media.
+- The media keeps the full history and stays consistent: a restore against it gives the same result at every date as before. It just doesn't get any smaller.
+
+Before copying, make sure no squash is pending (`dabbak list` must not show `squash pending`). If one is, run `prune --force` or `squash --force` first so it finishes. Otherwise `copy` would carry the temporary `__squashed` / `__squash.json` markers to the media and never remove them.
+
+To shrink the media as well, choose one of two ways:
+
+1. **Mirror instead of copy.** `scm dabsync.scm sync /backup/partial /media/usb/partial` makes the media match local exactly, pruned folders included. Only use this if the media should never hold more history than the local disk.
+2. **Prune the media with its own retention** (recommended when the media is the long-term archive). Make a second config that is identical to the normal one except that `destination.directory_partial` points at the media. Prune only needs each snapshot's `__state.json` and the configured source directories:
+
+   ```bash
+   # local: 90 days of dailies; media: monthly for 2 years, then yearly forever
+   scm dabbak.scm prune --keep-days 90 --force
+   scm dabsync.scm copy /backup/partial /media/usb/partial
+   DABBAK_CONFIG=backup-usb.json scm dabbak.scm prune --keep-days 90 --keep-monthly 24 --keep-yearly all --force
+   ```
+
+   Make the media policy keep at least what the local policy keeps (here `--keep-days 90` on both). Otherwise the next `copy` brings back a snapshot the media just pruned but local still has, and every cycle copies and squashes it again.
+
+   The same config also restores from the media (`DABBAK_CONFIG=backup-usb.json scm dabbak.scm restore ...`). It shares `full_state_file` with the normal config, and with it the lock, so a media prune and a local backup can never run at the same time. Don't run `backup` with this config, because that would write a new snapshot to the media.
+
 ## How it works (one-page tour)
 
 - **State** (`full_state_file`) is a JSON dict `{absolute_path: [size, mtime]}`. A file is "changed" if size differs, or if mtime differs by ≥ 2 seconds (the tolerance absorbs FAT/exFAT/SMB rounding).
@@ -350,8 +413,9 @@ Each config has its own state file → its own lock → the two can run concurre
 - **Mirror layout**: a source path `/home/me/Docs/x.txt` is stored under `directory_full/Docs/x.txt`. The last path component of the source directory becomes the top-level folder in the backup (this is why two sources `/home/a/Docs` and `/home/b/Docs` would collide — give them distinct trailing names).
 - **Snapshot layout**: same shape as the mirror, but only files that changed on that day. Plus a `__state.json` file capturing the manifest for that point in time.
 - **Restore** loads `__state.json` from the requested date's snapshot as the manifest, then for each listed file searches the snapshot history newest-first for the most recent copy.
-- **Failure semantics**: any exception (or Ctrl-C) during the walk skips the deletion pass and merges state instead of overwriting it, so the next run resumes cleanly. The interrupted snapshot folder is marked `__incomplete` and ignored by restore/package.
-- **Concurrency**: every write command (`backup`, `package`, `refresh-state`, `prune --force`) acquires a per-config kernel advisory lock at `<full_state_file>.lock` (via dabscm's `file-lock` primitive). A second run sees a clear error instead of racing, and the OS releases the lock automatically when the process exits — so a crash never leaves a stale lock (the leftover empty `.lock` file is harmless).
+- **Failure semantics**: any exception (or Ctrl-C) during the walk skips the deletion pass and merges state instead of overwriting it, so the next run resumes cleanly. The interrupted snapshot folder is marked `__incomplete`. It is never a restore point, but its files are still found by later restores.
+- **Squash / prune** merge old snapshots forward into a later kept one: the newest copy of each file the kept snapshot's manifest still lists is moved in, and everything else is dropped. Every restore point at or after the kept snapshot stays the same.
+- **Concurrency**: every write command (`backup`, `package`, `refresh-state`, `prune --force`, `squash --force`) acquires a per-config kernel advisory lock at `<full_state_file>.lock` (via dabscm's `file-lock` primitive). A second run sees a clear error instead of racing, and the OS releases the lock automatically when the process exits — so a crash never leaves a stale lock (the leftover empty `.lock` file is harmless).
 - **Windows long paths**: handled inside the `(scm fs)` primitives, so >260-char paths work natively with no `\\?\` plumbing in the tool itself.
 
 ## Files dabbak writes
@@ -360,7 +424,7 @@ Each config has its own state file → its own lock → the two can run concurre
 - `<full_state_file>.tmp` — exists only briefly during atomic state write.
 - `<full_state_file>.lock` — the per-config exclusive lock; contains pid + timestamp for diagnostics.
 - `destination.directory_full/...` — the always-current mirror.
-- `destination.directory_partial/YYYY-MM-DD/` — dated snapshots, each containing changed-files-only + `__state.json` (+ `__incomplete` if the run failed).
+- `destination.directory_partial/YYYY-MM-DD/` — dated snapshots, each containing changed-files-only + `__state.json` (+ `__incomplete` if the run failed; `__squash.json` / `__squashed` only while a squash is in progress or was interrupted).
 - `destination.directory_partial/backup-partial-YYYY-MM-DD.log` — per-day log.
 - `backup-full.log` next to `dabbak.scm` — append-only audit log, auto-rotates to `.log.1` at 10 MB.
 - `<base_dir>/<packaging_state_file>` — last `package --full` timestamp.

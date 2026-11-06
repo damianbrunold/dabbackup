@@ -360,6 +360,189 @@
     (lambda (base script src full partial)
       (test-equal 2 (db-exit base "prune")))))
 
+;; ===================== squash / merge-forward =====================
+
+;; Build a synthetic snapshot partial/<date>/: `files` is ((rel . content) ..)
+;; under src/, `state` the src-relative paths listed in its __state.json (#f
+;; for no state file), `flags` extra marker files (e.g. "__incomplete").
+(define (make-snap partial src date files state . flags)
+  (let ((dir (join-path partial date)))
+    (make-dirs-test dir)
+    (for-each (lambda (f)
+                (make-file (join-path dir (string-append "src/" (car f)))
+                           (cdr f)))
+              files)
+    (when state
+      (write-file (join-path dir "__state.json")
+                  (string-append "{"
+                                 (string-join
+                                  (map (lambda (r)
+                                         (string-append "\""
+                                                        (join-path src r)
+                                                        "\": [1, 0]"))
+                                       state)
+                                  ", ")
+                                 "}")))
+    (for-each (lambda (m) (write-file (join-path dir m) "x")) flags)))
+
+(define (snap-file partial date rel)
+  (join-path partial date (string-append "src/" rel)))
+
+;; restore at `date` into a fresh dir; returns alist rel -> content (or #f)
+;; for the given rels.
+(define (restored base date rels)
+  (let ((dest (join-path base (string-append "restore-" date))))
+    (when (directory-exists? dest) (delete-directory dest))
+    (db base "restore" dest "-t" date)
+    (map (lambda (r)
+           (let ((f (join-path dest (string-append "src/" r))))
+             (cons r (and (file-exists? f) (read-file f)))))
+         rels)))
+
+;; A: f1 v1, f2, f4 (f4 deleted before B)   B: f1 v2, f3   C: f2 changed, f3 gone
+(define (make-abc partial src)
+  (make-snap partial src "2020-01-01"
+             '(("f1" . "v1") ("f2" . "f2") ("f4" . "f4"))
+             '("f1" "f2" "f4"))
+  (make-snap partial src "2020-02-01"
+             '(("f1" . "v2") ("f3" . "f3"))
+             '("f1" "f2" "f3"))
+  (make-snap partial src "2020-03-01" '(("f2" . "f2b")) '("f1" "f2")))
+
+(test-group "squash: later restore points are unchanged, dead files dropped"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (make-abc partial src)
+      (let ((before-b (restored base "2020-02-01" '("f1" "f2" "f3")))
+            (before-c (restored base "2020-03-01" '("f1" "f2" "f3"))))
+        (test-equal 0
+                    (db-exit base "squash" "--from" "2020-01-01" "--to"
+                             "2020-02-15" "--force"))
+        (test-equal #f (directory-exists? (join-path partial "2020-01-01")))
+        (test-equal "v2" (read-file (snap-file partial "2020-02-01" "f1")))
+        (test-equal "f2" (read-file (snap-file partial "2020-02-01" "f2")))
+        (test-equal #f (file-exists? (snap-file partial "2020-02-01" "f4")))
+        (test-equal #f
+                    (file-exists? (join-path partial "2020-02-01"
+                                             "__squash.json")))
+        (test-equal before-b (restored base "2020-02-01" '("f1" "f2" "f3")))
+        (test-equal before-c (restored base "2020-03-01" '("f1" "f2" "f3")))
+        (test-equal '(("f1" . "v2") ("f2" . "f2b") ("f3" . #f)) before-c)))))
+
+(test-group "squash: dry-run changes nothing and reports"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (make-abc partial src)
+      (let
+          ((out (db-out base "squash" "--from" "2020-01-01" "--to"
+                        "2020-02-15")))
+        (test-assert (string-contains out "DRY RUN"))
+        (test-assert (string-contains out "2020-01-01")))
+      (test-equal #t (file-exists? (snap-file partial "2020-01-01" "f1")))
+      (test-equal #f (file-exists? (snap-file partial "2020-02-01" "f2")))
+      (test-equal #f
+                  (file-exists? (join-path partial "2020-01-01"
+                                           "__squashed"))))))
+
+(test-group "squash: --json reports moved/dropped"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (make-abc partial src)
+      (let
+          ((out (db-out base "squash" "--from" "2020-01-01" "--to"
+                        "2020-02-15" "--force" "--json")))
+        (test-assert (string-contains out "\"target\": \"2020-02-01\""))
+        ;; f2 moved; f1 v1 (superseded) and f4 (deleted) dropped
+        (test-assert (string-contains out "\"moved\": 1"))
+        (test-assert (string-contains out "\"dropped\": 2"))))))
+
+(test-group "squash: missing/invalid dates exit 2"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (test-equal 2 (db-exit base "squash" "--from" "2020-01-01"))
+      (test-equal 2
+                  (db-exit base "squash" "--from" "2020-1-1" "--to"
+                           "2020-02-01")))))
+
+(test-group "squash: incomplete snapshot in range is folded in"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (make-snap partial src "2020-01-01" '(("f1" . "v1")) '("f1"))
+      (make-snap partial src "2020-01-02" '(("f6" . "new")) #f "__incomplete")
+      (make-snap partial src "2020-01-03" '(("f1" . "v2")) '("f1" "f6"))
+      ;; restore searches the incomplete dir for copies already
+      (test-equal '(("f1" . "v2") ("f6" . "new"))
+                  (restored base "2020-01-03" '("f1" "f6")))
+      (db base "squash" "--from" "2020-01-01" "--to" "2020-01-03" "--force")
+      (test-equal "new" (read-file (snap-file partial "2020-01-03" "f6")))
+      (test-equal #f (directory-exists? (join-path partial "2020-01-02"))))))
+
+(test-group "squash: resumes an interrupted job; restore correct meanwhile"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (make-snap partial src "2020-01-01"
+                 '(("f2" . "f2") ("f5" . "f5"))
+                 '("f2" "f5")
+                 "__squashed")
+      (make-snap partial src "2020-02-01" '(("f1" . "v2")) '("f1" "f2" "f5"))
+      ;; f2 was already moved when the "crash" happened
+      (move-file (snap-file partial "2020-01-01" "f2")
+                 (snap-file partial "2020-02-01" "f2"))
+      (write-file (join-path partial "2020-02-01/__squash.json")
+                  "{\"target\": \"2020-02-01\", \"sources\": [\"2020-01-01\"]}")
+      (test-equal '(("f1" . "v2") ("f2" . "f2") ("f5" . "f5"))
+                  (restored base "2020-02-01" '("f1" "f2" "f5")))
+      ;; a squash source is no longer a restore point
+      (test-equal 1
+                  (db-exit base "restore"
+                           (join-path base "r0")
+                           "-t"
+                           "2020-01-15"))
+      (test-assert (string-contains (db-out base "list") "squash pending"))
+      (test-equal 0 (db-exit base "prune" "--keep-last" "5" "--force"))
+      (test-equal #f (directory-exists? (join-path partial "2020-01-01")))
+      (test-equal "f5" (read-file (snap-file partial "2020-02-01" "f5")))
+      (test-equal #f
+                  (file-exists? (join-path partial "2020-02-01"
+                                           "__squash.json"))))))
+
+(test-group "prune: merges forward, restore stays complete (regression)"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (make-abc partial src)
+      (test-equal 0 (db-exit base "prune" "--keep-last" "1" "--force"))
+      (test-equal #f (directory-exists? (join-path partial "2020-01-01")))
+      (test-equal #f (directory-exists? (join-path partial "2020-02-01")))
+      (test-equal '(("f1" . "v2") ("f2" . "f2b") ("f3" . #f))
+                  (restored base "2020-03-01" '("f1" "f2" "f3"))))))
+
+(test-group "prune: --keep-monthly keeps the last snapshot per month"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (for-each (lambda (d) (make-snap partial src d '(("x" . "x")) '("x")))
+                '("2020-01-05" "2020-01-20" "2020-02-03" "2020-02-25"
+                  "2020-03-10"))
+      (let ((out (db-out base "prune" "--keep-monthly" "2" "--json")))
+        (test-assert (string-contains out "\"2020-02-03\": \"2020-02-25\""))
+        (test-assert (string-contains out "\"2020-01-05\": \"2020-02-25\""))
+        (test-assert (not (string-contains out "\"2020-02-25\": "))))
+      (db base "prune" "--keep-monthly" "2" "--force")
+      (test-equal '(#f #f #f #t #t)
+                  (map (lambda (d) (directory-exists? (join-path partial d)))
+                       '("2020-01-05" "2020-01-20" "2020-02-03" "2020-02-25"
+                         "2020-03-10"))))))
+
+(test-group "prune: --keep-yearly all keeps the last snapshot of every year"
+  (with-backup '()
+    (lambda (base script src full partial)
+      (for-each (lambda (d) (make-snap partial src d '(("x" . "x")) '("x")))
+                '("2019-06-01" "2019-12-01" "2020-03-01"))
+      (db base "prune" "--keep-yearly" "all" "--force")
+      (test-equal '(#f #t #t)
+                  (map (lambda (d) (directory-exists? (join-path partial d)))
+                       '("2019-06-01" "2019-12-01" "2020-03-01")))
+      (test-equal 2 (db-exit base "prune" "--keep-last" "all")))))
+
 ;; ===================== package =====================
 
 (test-group "package: --full chunks files and writes packaging state"

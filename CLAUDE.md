@@ -14,7 +14,7 @@ The tool was originally a Python script with a Tkinter GUI. The Scheme port repl
 scm dabbak.scm <command> [options]
 ```
 
-Commands: `init`, `backup`, `restore`, `list`, `prune`, `package`, `refresh-state`, `config`. Config is selected by the `DABBAK_CONFIG` env var (default `backup-config.json`), resolved relative to the directory of `dabbak.scm` (`base-dir`). The script runs `main` on load via `(main (cdr (command-line)))`.
+Commands: `init`, `backup`, `restore`, `list`, `prune`, `squash`, `package`, `refresh-state`, `config`. Config is selected by the `DABBAK_CONFIG` env var (default `backup-config.json`), resolved relative to the directory of `dabbak.scm` (`base-dir`). The script runs `main` on load via `(main (cdr (command-line)))`.
 
 There is **no `gui` command** — the dabscm runtime ships no windowing toolkit. Use the `legacy-python` branch for the Tkinter GUI.
 
@@ -29,7 +29,7 @@ scmj test-dabbak.scm
 
 ## Architecture
 
-`dabbak.scm` is self-contained, organized top-to-bottom as: small utilities, fnmatch/excludes, walk, config/state, path-prefix logic, locking, logging, the backup engine, restore/package/list/prune/refresh-state/init/config, then the CLI.
+`dabbak.scm` is self-contained, organized top-to-bottom as: small utilities, fnmatch/excludes, walk, config/state, path-prefix logic, locking, logging, the backup engine, snapshot history, restore/package/init/config/list, squash (merge-forward) + prune, refresh-state, then the CLI.
 
 ### JSON
 
@@ -48,9 +48,15 @@ State (`full_state_file`) is a JSON object `{absolute_path: [size, seconds]}`. *
 
 ### Backup engine (`make-backup`)
 
-Walks the union of configured sources, diffs each file against state, copies new/changed files into **both** `dest_full` (mirror) and `dest_partial/<today>/` (dated snapshot), then — only if the walk completed — deletes from both destinations any file in state but missing from the source. The walk runs inside a `guard`; any error (the runtime's nearest analogue to Ctrl-C) leaves `completed = #f`, which **skips the deletion pass and merges state** (old entries for unvisited paths preserved) and drops an `__incomplete` marker into the snapshot so `restore`/`package` ignore it. On success, the state is copied into the snapshot as `__state.json`. State is written atomically via tmp + `move-file` (rename). A changed file whose copy fails carries its OLD `[size, mtime]` forward so the next run retries; a failed new file stays out of state entirely.
+Walks the union of configured sources, diffs each file against state, copies new/changed files into **both** `dest_full` (mirror) and `dest_partial/<today>/` (dated snapshot), then — only if the walk completed — deletes from both destinations any file in state but missing from the source. The walk runs inside a `guard`; any error (the runtime's nearest analogue to Ctrl-C) leaves `completed = #f`, which **skips the deletion pass and merges state** (old entries for unvisited paths preserved) and drops an `__incomplete` marker into the snapshot so `restore`/`package` never use it as a restore point (its files are still searched). On success, the state is copied into the snapshot as `__state.json`. State is written atomically via tmp + `move-file` (rename). A changed file whose copy fails carries its OLD `[size, mtime]` forward so the next run retries; a failed new file stays out of state entirely.
 
 Output via `plog`: `++` new, `**` changed, `--` deleted, routed to `backup-full.log` (rotated at 10 MB) and `backup-partial-<date>.log` always; stdout is gated by `--quiet` (suppresses info/file lines) and `--json` (suppresses everything but the final stats JSON). A lightweight `Progress` writes a throttled tally to stderr (so it never mixes with `--json` on stdout).
+
+### Snapshot history, squash and prune
+
+`snapshot-history` is shared by restore and package. It returns the *point* (the newest **complete** snapshot ≤ T: has `__state.json`, no `__incomplete`, no `__squashed`) and the *search* list (every dated dir ≤ the point, newest first, **including** incomplete and squash-source dirs, because their files are versions the later state refers to).
+
+`squash --from/--to` and `prune` both use **merge-forward** (`run-squash-job!`). The sources are merged into a later complete target K, newest-first. For each file: K already has it (or `claimed` it) → drop; still in K's `__state.json` (`snapshot-relpath-set`, `/`-normalized relpaths) → move into K; otherwise drop. This keeps every restore at or after K identical. Prune's retention (`select-kept-snapshots`: keep-last/days/monthly/yearly, plus today and the newest complete snapshot; only complete snapshots can be kept) feeds `plan-squash-jobs`, which merges each non-kept run into the next kept snapshot. **Crash safety:** `K/__squash.json` is written first, then a `__squashed` marker goes into each source. Sources stop being restore points but stay searchable, so restore at K is correct throughout. `resume-pending-squash!` finishes leftover jobs at the start of `squash --force` / `prune --force`. Source partial logs are prepended to K's log.
 
 ### Path layout
 
